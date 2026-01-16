@@ -19,7 +19,34 @@ app.use(
   })
 );
 
-app.get("/health", (_req: Request, res: Response) => res.json({ ok: true }));
+// ✅ Root route so the base Render URL works (fixes "Cannot GET /")
+app.get("/", (_req: Request, res: Response) => {
+  res
+    .status(200)
+    .type("text/plain")
+    .send(
+      [
+        "Planet Fatness Backend ✅",
+        "",
+        "Endpoints:",
+        "  GET  /health",
+        "  POST /auth/*",
+        "  GET  /activity/me   (auth)",
+        "  POST /activity/add  (auth)",
+        "  GET  /leaderboard",
+        "",
+        "tapping counts as cardio 🟣🟡",
+      ].join("\n")
+    );
+});
+
+app.get("/health", (_req: Request, res: Response) =>
+  res.json({
+    ok: true,
+    service: "planetfatness-backend",
+    ts: new Date().toISOString(),
+  })
+);
 
 app.use("/auth", authRouter);
 
