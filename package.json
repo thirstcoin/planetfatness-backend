@@ -2,12 +2,14 @@
   "name": "planetfatness-backend",
   "version": "1.0.0",
   "type": "module",
-  "private": true,
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@types/node": "^20.11.19",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.6",
     "bs58": "^5.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
@@ -17,13 +19,6 @@
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
-    "@types/jsonwebtoken": "^9.0.6",
-    "@types/node": "^20.11.19",
-    "@types/pg": "^8.10.9",
     "typescript": "^5.3.3"
-  },
-  "engines": {
-    "node": ">=20"
   }
 }
