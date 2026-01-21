@@ -11,15 +11,11 @@ export const pool = new Pool({
   ssl: DATABASE_URL.includes("localhost") ? undefined : { rejectUnauthorized: false },
 });
 
-/**
- * Small helpers
- */
 function randId(len = 10) {
   return crypto.randomBytes(Math.ceil(len / 2)).toString("hex").slice(0, len);
 }
 
 function normalizeName(name: string) {
-  // allow letters, numbers, underscore, dash. 3-18 chars.
   const cleaned = String(name || "")
     .trim()
     .replace(/\s+/g, "_")
@@ -52,7 +48,7 @@ async function indexExists(indexName: string) {
 }
 
 export async function initDb() {
-  // USERS: lifetime rollups + profile identity
+  // USERS: lifetime rollups + profile identity + airdrop points (tickets)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       address TEXT PRIMARY KEY,
@@ -60,11 +56,9 @@ export async function initDb() {
       best_seconds NUMERIC DEFAULT 0,
       total_miles NUMERIC DEFAULT 0,
 
-      -- ✅ NEW (profile identity)
       gym_id TEXT,
       display_name TEXT,
 
-      -- ✅ NEW (airdrop points / tickets)
       airdrop_points BIGINT DEFAULT 0,
 
       created_at TIMESTAMP DEFAULT NOW(),
@@ -72,7 +66,6 @@ export async function initDb() {
     );
   `);
 
-  // Ensure new columns exist even if users table was created earlier
   if (!(await columnExists("users", "gym_id"))) {
     await pool.query(`ALTER TABLE users ADD COLUMN gym_id TEXT;`);
   }
@@ -83,12 +76,9 @@ export async function initDb() {
     await pool.query(`ALTER TABLE users ADD COLUMN airdrop_points BIGINT DEFAULT 0;`);
   }
 
-  // Unique constraints for gym_id + display_name (safe create)
-  // Postgres doesn't have IF NOT EXISTS for ADD CONSTRAINT in older versions, so we use indexes.
+  // Unique indexes (safe)
   if (!(await indexExists("users_gym_id_uq"))) {
-    await pool.query(
-      `CREATE UNIQUE INDEX users_gym_id_uq ON users (gym_id) WHERE gym_id IS NOT NULL;`
-    );
+    await pool.query(`CREATE UNIQUE INDEX users_gym_id_uq ON users (gym_id) WHERE gym_id IS NOT NULL;`);
   }
   if (!(await indexExists("users_display_name_uq"))) {
     await pool.query(
@@ -101,15 +91,15 @@ export async function initDb() {
     CREATE TABLE IF NOT EXISTS sessions (
       id BIGSERIAL PRIMARY KEY,
       address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
-      game TEXT NOT NULL,                  -- runner | snack | lift | basket | etc
+      game TEXT NOT NULL,                  -- runner | snack | lift | basket
 
-      calories BIGINT DEFAULT 0,            -- base calories credited (usually 0 for tickets-only games)
+      calories BIGINT DEFAULT 0,
       miles NUMERIC DEFAULT 0,
       best_seconds NUMERIC DEFAULT 0,
       score NUMERIC DEFAULT 0,
       duration_ms BIGINT DEFAULT 0,
 
-      -- ✅ NEW: tickets receipts (airdrop points)
+      -- tickets receipt fields (for future PHAT multiplier)
       base_tickets BIGINT DEFAULT 0,
       final_tickets BIGINT DEFAULT 0,
       multiplier NUMERIC DEFAULT 1,
@@ -119,7 +109,7 @@ export async function initDb() {
     );
   `);
 
-  // Ensure new session columns exist
+  // Ensure session new cols
   if (!(await columnExists("sessions", "base_tickets"))) {
     await pool.query(`ALTER TABLE sessions ADD COLUMN base_tickets BIGINT DEFAULT 0;`);
   }
@@ -134,13 +124,31 @@ export async function initDb() {
   }
 
   // Indexes
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS sessions_addr_created_idx ON sessions(address, created_at DESC);`
-  );
+  await pool.query(`CREATE INDEX IF NOT EXISTS sessions_addr_created_idx ON sessions(address, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS sessions_created_idx ON sessions(created_at DESC);`);
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS sessions_game_created_idx ON sessions(game, created_at DESC);`
-  );
+  await pool.query(`CREATE INDEX IF NOT EXISTS sessions_game_created_idx ON sessions(game, created_at DESC);`);
+
+  // AUTH NONCES: wallet login (message + nonce) with expiry
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS auth_nonces (
+      address TEXT PRIMARY KEY REFERENCES users(address) ON DELETE CASCADE,
+      nonce TEXT NOT NULL,
+      message TEXT NOT NULL,
+      expires_at BIGINT NOT NULL
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS auth_nonces_expires_idx ON auth_nonces(expires_at);`);
+
+  // DAILY CAPS: track per-day credited calories (so server enforces cap)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_caps (
+      address TEXT PRIMARY KEY REFERENCES users(address) ON DELETE CASCADE,
+      day_key TEXT NOT NULL,            -- e.g., "2026-01-21"
+      today BIGINT DEFAULT 0,
+      reset_at BIGINT NOT NULL
+    );
+  `);
 
   // updated_at helper
   await pool
@@ -159,9 +167,7 @@ export async function initDb() {
     .query(`
     DO $$
     BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger WHERE tgname = 'users_set_updated_at'
-      ) THEN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'users_set_updated_at') THEN
         CREATE TRIGGER users_set_updated_at
         BEFORE UPDATE ON users
         FOR EACH ROW
@@ -177,10 +183,16 @@ export type UserRow = {
   total_calories: string | number;
   best_seconds: string | number;
   total_miles: string | number;
-
   gym_id?: string | null;
   display_name?: string | null;
   airdrop_points?: string | number;
+};
+
+export type DailyRow = {
+  address: string;
+  day_key: string;
+  today: string | number;
+  reset_at: string | number;
 };
 
 export type SessionRow = {
@@ -192,76 +204,15 @@ export type SessionRow = {
   best_seconds: string | number;
   score: string | number;
   duration_ms: string | number;
-
   base_tickets?: string | number;
   final_tickets?: string | number;
   multiplier?: string | number;
   phat_balance?: string | number;
-
   created_at: string;
 };
 
-/**
- * Ensures user exists. (Back-compat)
- */
 export async function upsertUser(address: string) {
-  await pool.query(
-    `INSERT INTO users (address) VALUES ($1)
-     ON CONFLICT (address) DO NOTHING`,
-    [address]
-  );
-}
-
-/**
- * ✅ NEW: Ensure user has gym_id + default display_name
- * - gym_id = short stable unique ID
- * - display_name default = "LUNK_<gymid>" unless already set
- */
-export async function ensureUserProfile(address: string) {
-  await upsertUser(address);
-
-  // Try a few times to avoid rare unique collisions
-  for (let i = 0; i < 6; i++) {
-    const me = await pool.query<UserRow>(
-      `SELECT address, gym_id, display_name, airdrop_points, total_calories, best_seconds, total_miles
-       FROM users WHERE address=$1`,
-      [address]
-    );
-    const row = me.rows[0] || null;
-    if (!row) return null;
-
-    const hasGymId = !!row.gym_id;
-    const hasName = !!row.display_name;
-
-    if (hasGymId && hasName) return row;
-
-    const gymId = hasGymId ? String(row.gym_id) : `PF${randId(10)}`; // e.g. PFa1b2c3d4e5
-    const defaultName = `LUNK_${gymId.slice(-6)}`; // e.g. LUNK_c3d4e5
-
-    try {
-      await pool.query(
-        `
-        UPDATE users
-        SET
-          gym_id = COALESCE(gym_id, $2),
-          display_name = COALESCE(display_name, $3)
-        WHERE address=$1
-        `,
-        [address, gymId, defaultName]
-      );
-      // loop will re-fetch and return
-    } catch {
-      // collision on unique indexes -> retry with a different id
-    }
-  }
-
-  // Final fetch even if name couldn't be set (extremely rare)
-  const r = await pool.query<UserRow>(
-    `SELECT address, gym_id, display_name, airdrop_points, total_calories, best_seconds, total_miles
-     FROM users WHERE address=$1`,
-    [address]
-  );
-  return r.rows[0] || null;
+  await pool.query(`INSERT INTO users (address) VALUES ($1) ON CONFLICT (address) DO NOTHING`, [address]);
 }
 
 export async function getMe(address: string) {
@@ -274,49 +225,173 @@ export async function getMe(address: string) {
 }
 
 /**
- * ✅ NEW: Profile payload (gymId + name) + lifetime stats
+ * Creates/ensures gym_id + default display_name.
+ * This matches your server import: ensureProfile()
  */
-export async function getProfile(address: string) {
-  const row = await ensureUserProfile(address);
-  if (!row) return null;
+export async function ensureProfile(address: string) {
+  await upsertUser(address);
 
-  return {
-    address: row.address,
-    gymId: row.gym_id || null,
-    displayName: row.display_name || null,
-    lifetime: {
-      totalCalories: Number(row.total_calories || 0),
-      totalMiles: Number(row.total_miles || 0),
-      bestSeconds: Number(row.best_seconds || 0),
-      tickets: Number((row.airdrop_points as any) || 0),
-    },
-  };
+  for (let i = 0; i < 6; i++) {
+    const me = await getMe(address);
+    if (!me) return null;
+
+    const hasGymId = !!me.gym_id;
+    const hasName = !!me.display_name;
+    if (hasGymId && hasName) return me;
+
+    const gymId = hasGymId ? String(me.gym_id) : `PF${randId(10)}`;
+    const defaultName = `LUNK_${gymId.slice(-6)}`;
+
+    try {
+      await pool.query(
+        `
+        UPDATE users
+        SET
+          gym_id = COALESCE(gym_id, $2),
+          display_name = COALESCE(display_name, $3)
+        WHERE address=$1
+        `,
+        [address, gymId, defaultName]
+      );
+    } catch {
+      // collision on unique indexes -> retry
+    }
+  }
+
+  return getMe(address);
 }
 
 /**
- * ✅ NEW: Change display name (unique)
+ * Unique display name setter.
+ * Server expects: setDisplayName(address, displayName) -> { ok, reason?, profile? }
  */
-export async function setDisplayName(params: { address: string; displayName: string }) {
-  const address = params.address;
-  await ensureUserProfile(address);
+export async function setDisplayName(address: string, displayName: string) {
+  await ensureProfile(address);
 
-  const next = normalizeName(params.displayName);
-  if (next.length < 3) {
-    return { ok: false, error: "Name too short (min 3 chars)." };
-  }
+  const next = normalizeName(displayName);
+  if (next.length < 3) return { ok: false, reason: "NAME_TOO_SHORT" };
 
   try {
     await pool.query(`UPDATE users SET display_name=$2 WHERE address=$1`, [address, next]);
-    const me = await getMe(address);
-    return { ok: true, displayName: me?.display_name || next };
-  } catch (e: any) {
-    // likely unique violation
-    return { ok: false, error: "Name already taken. Try another." };
+    const profile = await getMe(address);
+    return { ok: true, profile };
+  } catch {
+    return { ok: false, reason: "NAME_TAKEN" };
   }
 }
 
 /**
- * Existing behavior: update lifetime totals (kept compatible)
+ * AUTH NONCE storage
+ */
+export async function saveNonce(params: {
+  address: string;
+  nonce: string;
+  message: string;
+  expiresAt: number;
+}) {
+  await ensureProfile(params.address);
+
+  await pool.query(
+    `
+    INSERT INTO auth_nonces (address, nonce, message, expires_at)
+    VALUES ($1,$2,$3,$4)
+    ON CONFLICT (address) DO UPDATE SET
+      nonce=EXCLUDED.nonce,
+      message=EXCLUDED.message,
+      expires_at=EXCLUDED.expires_at
+    `,
+    [params.address, params.nonce, params.message, params.expiresAt]
+  );
+}
+
+/**
+ * Consume nonce (one-time). Returns { ok, message?, reason? }
+ */
+export async function consumeNonce(address: string) {
+  const r = await pool.query(
+    `SELECT nonce, message, expires_at FROM auth_nonces WHERE address=$1`,
+    [address]
+  );
+  const row = r.rows[0];
+  if (!row) return { ok: false as const, reason: "NO_NONCE" };
+
+  const expiresAt = Number(row.expires_at || 0);
+  if (Date.now() > expiresAt) {
+    await pool.query(`DELETE FROM auth_nonces WHERE address=$1`, [address]);
+    return { ok: false as const, reason: "NONCE_EXPIRED" };
+  }
+
+  // delete so it can't be reused
+  await pool.query(`DELETE FROM auth_nonces WHERE address=$1`, [address]);
+
+  return { ok: true as const, message: String(row.message) };
+}
+
+/**
+ * DAILY CAP tracking (server enforced)
+ * We keep a row per address with a day_key + reset timestamp.
+ */
+function dayKeyUTC(ts = Date.now()) {
+  const d = new Date(ts);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function nextResetUTC(ts = Date.now()) {
+  const d = new Date(ts);
+  // next UTC midnight
+  const next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0);
+  return next;
+}
+
+export async function getDaily(address: string) {
+  await ensureProfile(address);
+
+  const now = Date.now();
+  const key = dayKeyUTC(now);
+  const resetAt = nextResetUTC(now);
+
+  const r = await pool.query<DailyRow>(
+    `SELECT address, day_key, today, reset_at FROM daily_caps WHERE address=$1`,
+    [address]
+  );
+
+  if (!r.rows[0]) {
+    await pool.query(
+      `INSERT INTO daily_caps (address, day_key, today, reset_at) VALUES ($1,$2,$3,$4)`,
+      [address, key, 0, resetAt]
+    );
+    return { today: 0, resetAt };
+  }
+
+  const row = r.rows[0];
+  if (String(row.day_key) !== key || Number(row.reset_at || 0) <= now) {
+    await pool.query(
+      `UPDATE daily_caps SET day_key=$2, today=$3, reset_at=$4 WHERE address=$1`,
+      [address, key, 0, resetAt]
+    );
+    return { today: 0, resetAt };
+  }
+
+  return { today: Number(row.today || 0), resetAt: Number(row.reset_at || resetAt) };
+}
+
+export async function addDailyCalories(address: string, add: number) {
+  await ensureProfile(address);
+  const daily = await getDaily(address);
+  const nextToday = Math.max(0, daily.today + Math.max(0, Math.floor(add || 0)));
+
+  await pool.query(
+    `UPDATE daily_caps SET today=$2 WHERE address=$1`,
+    [address, nextToday]
+  );
+
+  return { today: nextToday, resetAt: daily.resetAt };
+}
+
+/**
+ * Existing behavior: lifetime totals (kept compatible)
  */
 export async function addActivity(params: {
   address: string;
@@ -328,7 +403,7 @@ export async function addActivity(params: {
   const addMiles = Math.max(0, Number(params.addMiles ?? 0));
   const bestSeconds = Number(params.bestSeconds ?? 0);
 
-  await ensureUserProfile(params.address);
+  await ensureProfile(params.address);
 
   await pool.query(
     `
@@ -346,32 +421,7 @@ export async function addActivity(params: {
 }
 
 /**
- * ✅ NEW: Add tickets (airdrop points) to users table (lifetime tally)
- * You will call this from the server after applying multiplier.
- */
-export async function addTickets(params: { address: string; addTickets: number }) {
-  const add = Math.max(0, Math.floor(Number(params.addTickets || 0)));
-  await ensureUserProfile(params.address);
-
-  await pool.query(
-    `
-    UPDATE users
-    SET airdrop_points = COALESCE(airdrop_points,0) + $2
-    WHERE address=$1
-    `,
-    [params.address, add]
-  );
-
-  const me = await getMe(params.address);
-  return {
-    address: params.address,
-    tickets: Number((me?.airdrop_points as any) || 0),
-    added: add,
-  };
-}
-
-/**
- * Log a session receipt (kept compatible; now supports tickets fields too)
+ * Session receipt logging (compatible with your server call)
  */
 export async function logSession(params: {
   address: string;
@@ -382,16 +432,14 @@ export async function logSession(params: {
   score?: number;
   durationMs?: number;
 
-  // ✅ NEW optional receipt fields
   baseTickets?: number;
   finalTickets?: number;
   multiplier?: number;
   phatBalance?: number;
 }) {
-  await ensureUserProfile(params.address);
+  await ensureProfile(params.address);
 
   const game = String(params.game || "unknown").slice(0, 32);
-
   const calories = Math.max(0, Math.floor(Number(params.calories ?? 0)));
   const miles = Math.max(0, Number(params.miles ?? 0));
   const bestSeconds = Math.max(0, Number(params.bestSeconds ?? 0));
@@ -410,10 +458,8 @@ export async function logSession(params: {
       base_tickets, final_tickets, multiplier, phat_balance
     )
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-    RETURNING
-      id, address, game, calories, miles, best_seconds, score, duration_ms,
-      base_tickets, final_tickets, multiplier, phat_balance,
-      created_at
+    RETURNING id, address, game, calories, miles, best_seconds, score, duration_ms,
+              base_tickets, final_tickets, multiplier, phat_balance, created_at
     `,
     [
       params.address,
@@ -433,180 +479,17 @@ export async function logSession(params: {
   return r.rows[0];
 }
 
-export async function getLeaderboard(limit = 30) {
-  const r = await pool.query<UserRow>(
-    `
-    SELECT address, total_calories, best_seconds, total_miles, gym_id, display_name, airdrop_points
-    FROM users
-    ORDER BY total_calories DESC, best_seconds DESC
-    LIMIT $1
-    `,
-    [limit]
-  );
-  return r.rows;
+/**
+ * Compatibility exports (you imported these but aren’t using them yet)
+ * If you don't need them, you can remove from server imports later.
+ */
+export async function getDailyCalories(address: string) {
+  return getDaily(address);
 }
 
 /**
- * ✅ NEW: Tickets leaderboard (lifetime)
+ * You had these names in your import list (but server uses getDaily/addDailyCalories).
+ * Keeping aliases avoids confusion.
  */
-export async function getTicketsLeaderboard(limit = 30) {
-  const lim = Math.max(1, Math.min(200, Number(limit || 30)));
-  const r = await pool.query(
-    `
-    SELECT address, gym_id, display_name, COALESCE(airdrop_points,0) AS tickets
-    FROM users
-    ORDER BY COALESCE(airdrop_points,0) DESC
-    LIMIT $1
-    `,
-    [lim]
-  );
-
-  return r.rows.map((x: any) => ({
-    address: x.address,
-    gymId: x.gym_id || null,
-    displayName: x.display_name || null,
-    tickets: Number(x.tickets || 0),
-  }));
-}
-
-/**
- * Flexible leaderboard from sessions (extended to support tickets)
- *
- * window:
- *  - "weekly"  = last 7 days
- *  - "monthly" = last 30 days
- *  - "lifetime" = all time
- *
- * metric:
- *  - "calories" (sum)
- *  - "miles"    (sum)
- *  - "score"    (max)
- *  - "bestSeconds" (max)
- *  - ✅ "tickets" (sum final_tickets)
- */
-export async function getLeaderboardV2(params: {
-  limit?: number;
-  window?: "weekly" | "monthly" | "lifetime";
-  metric?: "calories" | "miles" | "score" | "bestSeconds" | "tickets";
-  game?: string; // optional filter
-}) {
-  const limit = Math.max(1, Math.min(200, Number(params.limit ?? 30)));
-  const window = params.window ?? "lifetime";
-  const metric = params.metric ?? "calories";
-  const game = params.game ? String(params.game).slice(0, 32) : null;
-
-  let sinceSql = "";
-  if (window === "weekly") sinceSql = "AND s.created_at >= NOW() - INTERVAL '7 days'";
-  else if (window === "monthly") sinceSql = "AND s.created_at >= NOW() - INTERVAL '30 days'";
-
-  const gameSql = game ? "AND s.game = $2" : "";
-  const bind: any[] = [limit];
-  if (game) bind.push(game);
-
-  const aggCalories = "COALESCE(SUM(s.calories),0) AS calories";
-  const aggMiles = "COALESCE(SUM(s.miles),0) AS miles";
-  const aggBestSeconds = "COALESCE(MAX(s.best_seconds),0) AS best_seconds";
-  const aggScoreMax = "COALESCE(MAX(s.score),0) AS score";
-  const aggTickets = "COALESCE(SUM(s.final_tickets),0) AS tickets";
-
-  let orderExpr = "calories DESC";
-  if (metric === "miles") orderExpr = "miles DESC";
-  if (metric === "score") orderExpr = "score DESC";
-  if (metric === "bestSeconds") orderExpr = "best_seconds DESC";
-  if (metric === "tickets") orderExpr = "tickets DESC";
-
-  const sql = `
-    SELECT
-      s.address,
-      ${aggCalories},
-      ${aggMiles},
-      ${aggBestSeconds},
-      ${aggScoreMax},
-      ${aggTickets}
-    FROM sessions s
-    WHERE 1=1
-      ${sinceSql}
-      ${gameSql}
-    GROUP BY s.address
-    ORDER BY ${orderExpr}
-    LIMIT $1
-  `;
-
-  const r = await pool.query(sql, bind);
-
-  return r.rows.map((row: any) => ({
-    address: row.address,
-    totalCalories: Number(row.calories || 0),
-    totalMiles: Number(row.miles || 0),
-    bestSeconds: Number(row.best_seconds || 0),
-    score: Number(row.score || 0),
-    tickets: Number(row.tickets || 0),
-  }));
-}
-
-/**
- * User summary (weekly/monthly totals) + lifetime from users table
- * Extended with tickets totals from sessions.
- */
-export async function getActivitySummary(params: { address: string }) {
-  const address = params.address;
-  await ensureUserProfile(address);
-
-  const lifetime = await getMe(address);
-
-  const weekly = await pool.query(
-    `
-    SELECT
-      COALESCE(SUM(calories),0) AS calories,
-      COALESCE(SUM(miles),0) AS miles,
-      COALESCE(MAX(best_seconds),0) AS best_seconds,
-      COALESCE(MAX(score),0) AS score,
-      COALESCE(SUM(final_tickets),0) AS tickets
-    FROM sessions
-    WHERE address=$1 AND created_at >= NOW() - INTERVAL '7 days'
-    `,
-    [address]
-  );
-
-  const monthly = await pool.query(
-    `
-    SELECT
-      COALESCE(SUM(calories),0) AS calories,
-      COALESCE(SUM(miles),0) AS miles,
-      COALESCE(MAX(best_seconds),0) AS best_seconds,
-      COALESCE(MAX(score),0) AS score,
-      COALESCE(SUM(final_tickets),0) AS tickets
-    FROM sessions
-    WHERE address=$1 AND created_at >= NOW() - INTERVAL '30 days'
-    `,
-    [address]
-  );
-
-  return {
-    address,
-    profile: {
-      gymId: (lifetime as any)?.gym_id || null,
-      displayName: (lifetime as any)?.display_name || null,
-    },
-    lifetime: {
-      totalCalories: Number(lifetime?.total_calories || 0),
-      totalMiles: Number(lifetime?.total_miles || 0),
-      bestSeconds: Number(lifetime?.best_seconds || 0),
-      tickets: Number((lifetime as any)?.airdrop_points || 0),
-    },
-    weekly: {
-      calories: Number(weekly.rows[0]?.calories || 0),
-      miles: Number(weekly.rows[0]?.miles || 0),
-      bestSeconds: Number(weekly.rows[0]?.best_seconds || 0),
-      score: Number(weekly.rows[0]?.score || 0),
-      tickets: Number(weekly.rows[0]?.tickets || 0),
-    },
-    monthly: {
-      calories: Number(monthly.rows[0]?.calories || 0),
-      miles: Number(monthly.rows[0]?.miles || 0),
-      bestSeconds: Number(monthly.rows[0]?.best_seconds || 0),
-      score: Number(monthly.rows[0]?.score || 0),
-      tickets: Number(monthly.rows[0]?.tickets || 0),
-    },
-  };
-}
+export const getDaily_legacy = getDaily;
+export const addDailyCalories_legacy = addDailyCalories;
