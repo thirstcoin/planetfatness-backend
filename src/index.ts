@@ -1,8 +1,5 @@
 // src/index.ts
-// Planet Fatness Backend — Phase 2 hardened
-// ✅ Loads env BEFORE importing db/auth (critical for Render + ESM)
-// ✅ Fixes /activity/add aliasing (bestSeconds + v2 fields)
-// ✅ Keeps your existing routes + behavior intact
+// Planet Fatness Backend — Phase 2 hardened (plus profile + leaderboard windows)
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -29,6 +26,7 @@ const {
   logSession,
   getLeaderboardV2,
   getActivitySummary,
+  setDisplayName,
   pool,
 } = dbMod;
 
@@ -193,13 +191,15 @@ app.get("/", (_req: Request, res: Response) => {
         "Endpoints:",
         "  GET  /health",
         "  POST /auth/*",
+        "  GET  /profile/me           (auth)   [NEW]",
+        "  POST /profile/name         (auth)   [NEW]",
         "  GET  /activity/me          (auth)",
         "  POST /activity/add         (auth)   [legacy + optional receipts]",
-        "  POST /activity/submit      (auth)   [NEW: server-computed calories]",
-        "  GET  /activity/summary     (auth)   [NEW]",
-        "  GET  /daily/progress       (auth)   [NEW]",
+        "  POST /activity/submit      (auth)   [server-computed calories]",
+        "  GET  /activity/summary     (auth)",
+        "  GET  /daily/progress       (auth)",
         "  GET  /leaderboard",
-        "  GET  /leaderboard/v2       [NEW]",
+        "  GET  /leaderboard/v2       (window=day|week|month|lifetime)",
         "",
         "tapping counts as cardio 🟣🟡",
       ].join("\n")
@@ -217,8 +217,43 @@ app.get("/health", (_req: Request, res: Response) =>
 app.use("/auth", authRouter);
 
 /**
+ * NEW: GET /profile/me (auth)
+ */
+app.get("/profile/me", requireAuth, async (req: Request, res: Response) => {
+  const address = (req as any).user?.address as string;
+  const me = await getMe(address);
+  if (!me) return res.status(404).json({ error: "User not found" });
+
+  res.json({
+    address: me.address,
+    displayName: me.display_name || null,
+  });
+});
+
+/**
+ * NEW: POST /profile/name (auth)
+ * body: { displayName }
+ */
+app.post("/profile/name", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const address = (req as any).user?.address as string;
+    const displayName = String(req.body?.displayName || "").trim();
+
+    const u = await setDisplayName({ address, displayName });
+    if (!u) return res.status(500).json({ error: "Update failed" });
+
+    res.json({ ok: true, address: u.address, displayName: u.display_name || null });
+  } catch (e: any) {
+    const msg = String(e?.message || "");
+    if (msg === "displayName_too_short") return res.status(400).json({ error: "Name too short (min 2 chars)" });
+    console.error(e);
+    res.status(500).json({ error: "Name update failed" });
+  }
+});
+
+/**
  * GET /activity/me (auth)
- * returns: { address, totalCalories, bestSeconds, totalMiles }
+ * returns: { address, displayName, totalCalories, bestSeconds, totalMiles }
  */
 app.get("/activity/me", requireAuth, async (req: Request, res: Response) => {
   const address = (req as any).user?.address as string;
@@ -227,6 +262,7 @@ app.get("/activity/me", requireAuth, async (req: Request, res: Response) => {
 
   res.json({
     address: me.address,
+    displayName: me.display_name || null,
     totalCalories: Number(me.total_calories || 0),
     bestSeconds: Number(me.best_seconds || 0),
     totalMiles: Number(me.total_miles || 0),
@@ -234,7 +270,7 @@ app.get("/activity/me", requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * NEW: GET /activity/summary (auth)
+ * GET /activity/summary (auth)
  */
 app.get("/activity/summary", requireAuth, async (req: Request, res: Response) => {
   try {
@@ -248,7 +284,7 @@ app.get("/activity/summary", requireAuth, async (req: Request, res: Response) =>
 });
 
 /**
- * NEW: GET /daily/progress (auth)
+ * GET /daily/progress (auth)
  */
 app.get("/daily/progress", requireAuth, async (req: Request, res: Response) => {
   try {
@@ -311,7 +347,7 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
   const finalScore = Number.isFinite(v2Score as any) ? Number(v2Score) : 0;
   const finalDurationMs = Number.isFinite(v2DurationMs as any) ? Math.max(0, Math.floor(Number(v2DurationMs))) : 0;
 
-  // 1) Update lifetime rollups (same as before)
+  // 1) Update lifetime rollups
   const me = await addActivity({
     address,
     addCalories: Number.isFinite(finalAddCalories) ? finalAddCalories : 0,
@@ -321,7 +357,7 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
 
   if (!me) return res.status(500).json({ error: "Update failed" });
 
-  // 2) If it looks like a receipt, also log it (additive)
+  // 2) If it looks like a receipt, also log it
   const looksLikeReceipt =
     (!!game && game.length > 0) ||
     (Number.isFinite(finalScore as any) && finalScore > 0) ||
@@ -347,6 +383,7 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
 
   res.json({
     address: me.address,
+    displayName: (me as any).display_name || null,
     totalCalories: Number(me.total_calories || 0),
     bestSeconds: Number(me.best_seconds || 0),
     totalMiles: Number(me.total_miles || 0),
@@ -354,7 +391,7 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * NEW: POST /activity/submit (auth)
+ * POST /activity/submit (auth)
  * Server-computed calories + daily caps.
  */
 app.post("/activity/submit", requireAuth, async (req: Request, res: Response) => {
@@ -387,7 +424,7 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
     const remaining = Math.max(0, rules.dailyCapCalories - todayBefore.calories);
     const earnedCapped = Math.max(0, Math.min(calc.earnedCalories, remaining));
 
-    // 3) log receipt (always for submit)
+    // 3) log receipt
     await logSession({
       address,
       game,
@@ -450,6 +487,7 @@ app.get("/leaderboard", async (_req: Request, res: Response) => {
   res.json(
     top.map((u: any) => ({
       address: u.address,
+      displayName: u.display_name || null,
       totalCalories: Number(u.total_calories || 0),
       bestSeconds: Number(u.best_seconds || 0),
       totalMiles: Number(u.total_miles || 0),
@@ -458,7 +496,11 @@ app.get("/leaderboard", async (_req: Request, res: Response) => {
 });
 
 /**
- * NEW: GET /leaderboard/v2
+ * GET /leaderboard/v2
+ * query:
+ *  window = lifetime | day | week | month
+ *  metric = calories | score | miles | duration
+ *  game   = runner | snack | lift | basket (optional)
  */
 app.get("/leaderboard/v2", async (req: Request, res: Response) => {
   try {
