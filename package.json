@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "postinstall": "npm i -D @types/node @types/express @types/jsonwebtoken @types/pg @types/cors"
   },
   "dependencies": {
     "express": "^4.19.2",
