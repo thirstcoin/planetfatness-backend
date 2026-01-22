@@ -21,12 +21,19 @@ export async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       address TEXT PRIMARY KEY,
+      display_name TEXT,
       total_calories BIGINT NOT NULL DEFAULT 0,
       best_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
       total_miles DOUBLE PRECISION NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  // If users existed before, add column safely
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS display_name TEXT;
   `);
 
   // Sessions table = receipts (per-run logging)
@@ -77,6 +84,32 @@ export async function getMe(address: string) {
   return r.rows[0] || null;
 }
 
+export async function setDisplayName(params: { address: string; displayName: string }) {
+  const address = String(params.address || "").trim();
+  let displayName = String(params.displayName || "").trim();
+
+  if (!address) throw new Error("missing address");
+
+  // basic sanitation + length cap
+  displayName = displayName.replace(/\s+/g, " ").slice(0, 24);
+  if (displayName.length < 2) throw new Error("displayName_too_short");
+
+  await upsertUser(address);
+
+  const r = await pool.query(
+    `
+    UPDATE users
+    SET display_name = $2,
+        updated_at = NOW()
+    WHERE address = $1
+    RETURNING *;
+    `,
+    [address, displayName]
+  );
+
+  return r.rows[0] || null;
+}
+
 /**
  * addActivity updates lifetime totals.
  * - total_calories += addCalories
@@ -118,7 +151,7 @@ export async function getLeaderboard(limit = 30) {
   const lim = Math.max(1, Math.min(200, Number(limit || 30)));
   const r = await pool.query(
     `
-    SELECT address, total_calories, best_seconds, total_miles
+    SELECT address, display_name, total_calories, best_seconds, total_miles
     FROM users
     ORDER BY total_calories DESC, best_seconds DESC
     LIMIT $1;
@@ -167,12 +200,12 @@ export async function logSession(params: {
 
 // -------------------------------
 // Leaderboard V2
-// window: lifetime | day | week
+// window: lifetime | day | week | month
 // metric: calories | score | miles | duration
 // optional game filter
 // -------------------------------
 export async function getLeaderboardV2(params: {
-  window: "lifetime" | "day" | "week" | string;
+  window: "lifetime" | "day" | "week" | "month" | string;
   metric: "calories" | "score" | "miles" | "duration" | string;
   game?: string;
   limit?: number;
@@ -186,6 +219,7 @@ export async function getLeaderboardV2(params: {
   let whereTime = "";
   if (window === "day") whereTime = `AND created_at >= date_trunc('day', NOW())`;
   if (window === "week") whereTime = `AND created_at >= date_trunc('week', NOW())`;
+  if (window === "month") whereTime = `AND created_at >= date_trunc('month', NOW())`;
 
   const whereGame = game ? `AND game = $2` : "";
   const args: any[] = [limit];
@@ -197,13 +231,14 @@ export async function getLeaderboardV2(params: {
   if (metric === "miles") metricExpr = "SUM(miles)";
   if (metric === "duration") metricExpr = "SUM(duration_ms)";
 
-  // lifetime shortcut uses users table for calories / miles / best
+  // lifetime shortcut uses users table for calories / miles
   if (window === "lifetime" && (metric === "calories" || metric === "miles")) {
     const col = metric === "miles" ? "total_miles" : "total_calories";
     const r = await pool.query(
       `
       SELECT
         address,
+        display_name,
         ${col} AS value,
         total_calories,
         total_miles,
@@ -217,21 +252,23 @@ export async function getLeaderboardV2(params: {
     return r.rows || [];
   }
 
-  // otherwise aggregate sessions
+  // otherwise aggregate sessions + join users for display_name
   const r = await pool.query(
     `
     SELECT
-      address,
+      s.address,
+      u.display_name,
       ${metricExpr}::DOUBLE PRECISION AS value,
-      SUM(calories)::DOUBLE PRECISION AS calories,
-      SUM(miles)::DOUBLE PRECISION AS miles,
-      SUM(score)::DOUBLE PRECISION AS score,
-      SUM(duration_ms)::DOUBLE PRECISION AS duration_ms
-    FROM sessions
+      SUM(s.calories)::DOUBLE PRECISION AS calories,
+      SUM(s.miles)::DOUBLE PRECISION AS miles,
+      SUM(s.score)::DOUBLE PRECISION AS score,
+      SUM(s.duration_ms)::DOUBLE PRECISION AS duration_ms
+    FROM sessions s
+    LEFT JOIN users u ON u.address = s.address
     WHERE 1=1
       ${whereTime}
       ${whereGame}
-    GROUP BY address
+    GROUP BY s.address, u.display_name
     ORDER BY value DESC
     LIMIT $1;
     `,
@@ -278,6 +315,20 @@ export async function getActivitySummary(params: { address: string }) {
     [address]
   );
 
+  const month = await pool.query(
+    `
+    SELECT
+      COALESCE(SUM(calories),0) AS calories,
+      COALESCE(SUM(score),0) AS score,
+      COALESCE(SUM(miles),0) AS miles,
+      COALESCE(SUM(duration_ms),0) AS duration_ms
+    FROM sessions
+    WHERE address=$1
+      AND created_at >= date_trunc('month', NOW());
+    `,
+    [address]
+  );
+
   const byGame = await pool.query(
     `
     SELECT
@@ -297,6 +348,9 @@ export async function getActivitySummary(params: { address: string }) {
 
   return {
     address,
+    profile: {
+      displayName: me?.display_name || null,
+    },
     lifetime: {
       totalCalories: Number(me?.total_calories || 0),
       totalMiles: Number(me?.total_miles || 0),
@@ -313,6 +367,12 @@ export async function getActivitySummary(params: { address: string }) {
       score: Number(week.rows[0]?.score || 0),
       miles: Number(week.rows[0]?.miles || 0),
       durationMs: Number(week.rows[0]?.duration_ms || 0),
+    },
+    month: {
+      calories: Number(month.rows[0]?.calories || 0),
+      score: Number(month.rows[0]?.score || 0),
+      miles: Number(month.rows[0]?.miles || 0),
+      durationMs: Number(month.rows[0]?.duration_ms || 0),
     },
     last30DaysByGame: (byGame.rows || []).map((r: any) => ({
       game: r.game,
