@@ -4,8 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "postinstall": "npm i -D @types/node @types/express @types/jsonwebtoken @types/pg @types/cors"
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "express": "^4.19.2",
@@ -14,11 +13,12 @@
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.11.5",
     "tweetnacl": "^1.0.3",
-    "bs58": "^5.0.0"
+    "bs58": "^5.0.0",
+
+    "@types/node": "^20.11.19"
   },
   "devDependencies": {
     "typescript": "^5.3.3",
-    "@types/node": "^20.11.19",
     "@types/express": "^4.17.21",
     "@types/jsonwebtoken": "^9.0.6",
     "@types/pg": "^8.10.11",
