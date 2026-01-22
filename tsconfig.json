@@ -4,14 +4,22 @@
     "lib": ["ES2022"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "outDir": "dist",
+
     "rootDir": "src",
+    "outDir": "dist",
+
     "strict": true,
     "noImplicitAny": false,
+
     "esModuleInterop": true,
+    "resolveJsonModule": true,
+
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+
+    "types": [],
+    "noEmitOnError": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
 }
