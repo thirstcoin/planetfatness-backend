@@ -1,24 +1,31 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+
+    /* 🔑 THIS FIXES console / process / Node globals */
     "lib": ["ES2022"],
+    "types": ["node"],
+
+    /* ESM + NodeNext (matches your package.json "type": "module") */
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
 
+    /* Paths */
     "rootDir": "src",
     "outDir": "dist",
 
+    /* Safety */
     "strict": true,
     "noImplicitAny": false,
-
-    "esModuleInterop": true,
-    "resolveJsonModule": true,
-
-    "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
 
-    "types": [],
-    "noEmitOnError": true
+    /* Interop */
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+
+    /* Required for Render */
+    "resolveJsonModule": true
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
