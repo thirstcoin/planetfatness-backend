@@ -22,6 +22,9 @@ if (!TG_BOT_TOKEN) {
 // Optional: how old initData can be (seconds). Default 1 day.
 const TG_MAX_AGE_SEC = Number(process.env.TG_MAX_AGE_SEC || 86400);
 
+// Optional debug logs (set to "1" in Render to see TG verify details)
+const TG_DEBUG = (process.env.TG_DEBUG || "").trim() === "1";
+
 type Challenge = { nonce: string; message: string; exp: number };
 const challenges = new Map<string, Challenge>();
 
@@ -186,18 +189,23 @@ router.post("/verify", async (req: Request, res: Response) => {
 
 function parseInitData(initData: string): Record<string, string> {
   const out: Record<string, string> = {};
-  const s = safeStr(initData);
+  let s = safeStr(initData);
   if (!s) return out;
 
-  const parts = s.split("&");
-  for (const p of parts) {
-    const eq = p.indexOf("=");
-    if (eq === -1) continue;
-    const k = decodeURIComponent(p.slice(0, eq));
-    const v = decodeURIComponent(p.slice(eq + 1));
+  // Sometimes people accidentally pass "?a=b&c=d"
+  if (s.startsWith("?")) s = s.slice(1);
+
+  // ✅ URLSearchParams handles + and % decoding the way Telegram expects
+  const usp = new URLSearchParams(s);
+  usp.forEach((v, k) => {
     out[k] = v;
-  }
+  });
   return out;
+}
+
+function buildDataCheckString(data: Record<string, string>) {
+  const keys = Object.keys(data).filter((k) => k !== "hash").sort();
+  return keys.map((k) => `${k}=${data[k]}`).join("\n");
 }
 
 function verifyTelegramInitData(
@@ -208,11 +216,19 @@ function verifyTelegramInitData(
   const hash = data.hash;
   if (!hash) return { ok: false, error: "missing_hash" };
 
-  const keys = Object.keys(data).filter((k) => k !== "hash").sort();
-  const dataCheckString = keys.map((k) => `${k}=${data[k]}`).join("\n");
+  const dataCheckString = buildDataCheckString(data);
 
+  // Per Telegram docs: secret_key = sha256(bot_token)
   const secretKey = crypto.createHash("sha256").update(botToken).digest();
   const computed = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
+
+  if (TG_DEBUG) {
+    console.log("[TG_VERIFY] keys:", Object.keys(data).sort().join(","));
+    console.log("[TG_VERIFY] initData len:", safeStr(initData).length);
+    console.log("[TG_VERIFY] dataCheckString:", dataCheckString);
+    console.log("[TG_VERIFY] hash:", hash);
+    console.log("[TG_VERIFY] computed:", computed);
+  }
 
   if (computed !== hash) return { ok: false, error: "bad_hash" };
 
@@ -251,10 +267,9 @@ router.post("/telegram", async (req: Request, res: Response) => {
     const firstName = tgUser.first_name ? String(tgUser.first_name) : "";
     const lastName = tgUser.last_name ? String(tgUser.last_name) : "";
 
-    // Telegram-first identity (fits your existing JWT + DB model)
+    // Telegram-first identity
     const address = `tg:${tgIdNum}`;
 
-    // Ensure user row exists, then write telegram fields
     await upsertUser(address);
     await setTelegramIdentity({
       address,
@@ -264,7 +279,6 @@ router.post("/telegram", async (req: Request, res: Response) => {
       lastName: lastName || null,
     });
 
-    // Optional: keep your existing "display_name" behavior
     const displayName =
       (username ? `@${username}` : "") ||
       ([firstName, lastName].filter(Boolean).join(" ").trim().slice(0, 24)) ||
@@ -274,7 +288,7 @@ router.post("/telegram", async (req: Request, res: Response) => {
       try {
         await setDisplayName({ address, displayName });
       } catch {
-        // ignore name failures
+        // ignore
       }
     }
 
