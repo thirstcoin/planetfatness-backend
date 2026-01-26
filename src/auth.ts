@@ -2,7 +2,8 @@ import { Router, Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import nacl from "tweetnacl";
 import bs58 from "bs58";
-import { upsertUser } from "./db.js";
+import crypto from "crypto";
+import { upsertUser, setDisplayName } from "./db.js";
 
 const router = Router();
 
@@ -10,6 +11,15 @@ const JWT_SECRET = process.env.JWT_SECRET || "";
 if (!JWT_SECRET) {
   console.warn("⚠️ Missing JWT_SECRET (set it in Render env vars). Auth verify will fail.");
 }
+
+// Telegram Bot Token (from BotFather) for verifying WebApp initData
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
+if (!TG_BOT_TOKEN) {
+  console.warn("⚠️ Missing TG_BOT_TOKEN. /auth/telegram will fail until you set it.");
+}
+
+// Optional: how old initData can be (seconds). Default 1 day.
+const TG_MAX_AGE_SEC = Number(process.env.TG_MAX_AGE_SEC || 86400);
 
 type Challenge = { nonce: string; message: string; exp: number };
 const challenges = new Map<string, Challenge>();
@@ -151,6 +161,122 @@ router.post("/verify", async (req: Request, res: Response) => {
   } catch (e) {
     console.error("verify error:", e);
     return res.status(400).json({ error: "Verify error" });
+  }
+});
+
+/* =========================================================
+   TELEGRAM WEB APP AUTH
+   POST /auth/telegram
+   body: { initData }  // Telegram.WebApp.initData (raw querystring)
+   Returns: { token, address, telegram: {...}, displayName }
+   ========================================================= */
+
+function parseInitData(initData: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const s = String(initData || "").trim();
+  if (!s) return out;
+
+  // initData is querystring-like: key=value&key2=value2...
+  const parts = s.split("&");
+  for (const p of parts) {
+    const eq = p.indexOf("=");
+    if (eq === -1) continue;
+    const k = decodeURIComponent(p.slice(0, eq));
+    const v = decodeURIComponent(p.slice(eq + 1));
+    out[k] = v;
+  }
+  return out;
+}
+
+function verifyTelegramInitData(initData: string, botToken: string): { ok: true; data: any } | { ok: false; error: string } {
+  const data = parseInitData(initData);
+  const hash = data.hash;
+  if (!hash) return { ok: false, error: "missing_hash" };
+
+  // Build data_check_string: sorted "key=value" lines excluding hash
+  const keys = Object.keys(data).filter((k) => k !== "hash").sort();
+  const dataCheckString = keys.map((k) => `${k}=${data[k]}`).join("\n");
+
+  // secret_key = sha256(botToken)
+  const secretKey = crypto.createHash("sha256").update(botToken).digest();
+
+  // HMAC_SHA256(data_check_string, secret_key) => hex
+  const computed = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
+
+  if (computed !== hash) return { ok: false, error: "bad_hash" };
+
+  // auth_date freshness check (optional but recommended)
+  const authDate = Number(data.auth_date || 0);
+  if (!authDate) return { ok: false, error: "missing_auth_date" };
+
+  const ageSec = Math.floor(Date.now() / 1000) - authDate;
+  if (TG_MAX_AGE_SEC > 0 && ageSec > TG_MAX_AGE_SEC) return { ok: false, error: "initdata_too_old" };
+
+  // user field is JSON
+  let user: any = null;
+  try {
+    user = data.user ? JSON.parse(data.user) : null;
+  } catch {
+    user = null;
+  }
+  if (!user || !user.id) return { ok: false, error: "missing_user" };
+
+  return { ok: true, data: { ...data, user } };
+}
+
+router.post("/telegram", async (req: Request, res: Response) => {
+  try {
+    if (!JWT_SECRET) return res.status(500).json({ error: "Server missing JWT_SECRET" });
+    if (!TG_BOT_TOKEN) return res.status(500).json({ error: "Server missing TG_BOT_TOKEN" });
+
+    const initData = String(req.body?.initData || "").trim();
+    if (!initData) return res.status(400).json({ error: "Missing initData" });
+
+    const v = verifyTelegramInitData(initData, TG_BOT_TOKEN);
+    if (!v.ok) return res.status(401).json({ error: `tg_${v.error}` });
+
+    const tgUser = v.data.user as any;
+    const tgId = String(tgUser.id);
+    const username = tgUser.username ? String(tgUser.username) : "";
+    const firstName = tgUser.first_name ? String(tgUser.first_name) : "";
+    const lastName = tgUser.last_name ? String(tgUser.last_name) : "";
+
+    // Telegram-first identity "address" (fits your existing DB + JWT model)
+    const address = `tg:${tgId}`;
+
+    await upsertUser(address);
+
+    // Prefer @username if available, otherwise fallback to first/last
+    const displayName =
+      username ? `@${username}` : [firstName, lastName].filter(Boolean).join(" ").slice(0, 24);
+
+    // Only set if we have something usable
+    if (displayName && displayName.trim().length >= 2) {
+      try {
+        await setDisplayName({ address, displayName });
+      } catch {
+        // ignore name failures
+      }
+    }
+
+    const token = signToken(address);
+
+    return res.json({
+      ok: true,
+      token,
+      address,
+      displayName: displayName || null,
+      telegram: {
+        id: tgUser.id,
+        username: username || null,
+        first_name: firstName || null,
+        last_name: lastName || null,
+        language_code: tgUser.language_code || null,
+      },
+    });
+  } catch (e) {
+    console.error("telegram auth error:", e);
+    return res.status(500).json({ error: "Telegram auth failed" });
   }
 });
 
