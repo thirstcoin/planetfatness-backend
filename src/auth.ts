@@ -15,35 +15,27 @@ if (!JWT_SECRET) {
 
 /**
  * ✅ Telegram Bot Token (from BotFather)
- * Most common tg_bad_hash cause: token has trailing newline/space or accidental quotes in env.
- * We hard-clean it here.
+ * Common bad_hash cause: accidental quotes / spaces / newline in env.
+ * We hard-clean here. (We do NOT print the token.)
  */
 const TG_BOT_TOKEN = String(process.env.TG_BOT_TOKEN || "")
   .trim()
-  .replace(/^\s+|\s+$/g, "")
-  .replace(/^"+|"+$/g, "") // strip accidental quotes
-  .replace(/^'+|'+$/g, ""); // strip accidental quotes
+  .replace(/^"+|"+$/g, "")
+  .replace(/^'+|'+$/g, "");
 
 if (!TG_BOT_TOKEN) {
   console.warn("⚠️ Missing TG_BOT_TOKEN. /auth/telegram will fail until you set it.");
 } else {
-  // Safe diagnostics (does NOT print the token)
   const hasNewline = TG_BOT_TOKEN.includes("\n") || TG_BOT_TOKEN.includes("\r");
   const hasSpace = TG_BOT_TOKEN.includes(" ");
-  console.log(
-    "[TG] TG_BOT_TOKEN len:",
-    TG_BOT_TOKEN.length,
-    "has_newline:",
-    hasNewline,
-    "has_space:",
-    hasSpace
-  );
+  const botId = TG_BOT_TOKEN.split(":")[0] || "unknown";
+  console.log("[TG] TG_BOT_TOKEN botId:", botId, "len:", TG_BOT_TOKEN.length, "newline:", hasNewline, "space:", hasSpace);
 }
 
 // Optional: how old initData can be (seconds). Default 1 day.
 const TG_MAX_AGE_SEC = Number(process.env.TG_MAX_AGE_SEC || 86400);
 
-// Optional debug logs (set TG_DEBUG=1 in Render to see TG verify details)
+// Optional debug logs (set TG_DEBUG=1 in Render)
 const TG_DEBUG = String(process.env.TG_DEBUG || "").trim() === "1";
 
 type Challenge = { nonce: string; message: string; exp: number };
@@ -61,7 +53,7 @@ function signToken(address: string) {
 }
 
 function safeStr(a: any) {
-  return String(a || "").trim();
+  return String(a ?? "").trim();
 }
 
 /**
@@ -73,15 +65,11 @@ function decodeSignature(sig: string): Uint8Array {
   const s = safeStr(sig);
   if (!s) throw new Error("empty signature");
 
-  // Heuristic: base64 often has + / = and is longer; base58 won't.
   const looksBase64 = /[+/=]/.test(s) || s.length > 70;
-
   if (looksBase64) {
     const buf = Buffer.from(s, "base64");
     return new Uint8Array(buf);
   }
-
-  // fallback: base58
   return bs58.decode(s);
 }
 
@@ -92,7 +80,6 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 
   try {
     if (!JWT_SECRET) return res.status(500).json({ error: "Server missing JWT_SECRET" });
-
     const payload = jwt.verify(token, JWT_SECRET) as { address: string };
     (req as any).user = { address: payload.address };
     return next();
@@ -103,8 +90,6 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 
 /**
  * GET /auth/me
- * headers: Authorization: Bearer <token>
- * ✅ returns profile info (display name + tg fields)
  */
 router.get("/me", requireAuth, async (req: Request, res: Response) => {
   const address = (req as any).user?.address || null;
@@ -112,7 +97,6 @@ router.get("/me", requireAuth, async (req: Request, res: Response) => {
 
   try {
     const me = await getMe(address);
-
     return res.json({
       ok: true,
       address,
@@ -132,7 +116,6 @@ router.get("/me", requireAuth, async (req: Request, res: Response) => {
 
 /**
  * POST /auth/challenge
- * body: { address }
  */
 router.post("/challenge", async (req: Request, res: Response) => {
   const address = safeStr(req.body?.address);
@@ -150,14 +133,14 @@ router.post("/challenge", async (req: Request, res: Response) => {
     `Sign to prove you own this wallet.\n` +
     `No transactions. No approvals. No spending.`;
 
-  challenges.set(address, { nonce, message, exp: Date.now() + 5 * 60 * 1000 });
+  const exp = Date.now() + 5 * 60 * 1000;
+  challenges.set(address, { nonce, message, exp });
 
-  return res.json({ nonce, message, exp: Date.now() + 5 * 60 * 1000 });
+  return res.json({ nonce, message, exp });
 });
 
 /**
  * POST /auth/verify
- * body: { address, nonce, signature }
  */
 router.post("/verify", async (req: Request, res: Response) => {
   if (!JWT_SECRET) return res.status(500).json({ error: "Server missing JWT_SECRET" });
@@ -166,9 +149,7 @@ router.post("/verify", async (req: Request, res: Response) => {
   const nonce = safeStr(req.body?.nonce);
   const signature = safeStr(req.body?.signature);
 
-  if (!address || !nonce || !signature) {
-    return res.status(400).json({ error: "Missing fields" });
-  }
+  if (!address || !nonce || !signature) return res.status(400).json({ error: "Missing fields" });
 
   const ch = challenges.get(address);
   if (!ch) return res.status(400).json({ error: "No challenge found. Reconnect." });
@@ -178,9 +159,7 @@ router.post("/verify", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Challenge expired. Reconnect." });
   }
 
-  if (nonce !== ch.nonce) {
-    return res.status(400).json({ error: "Bad nonce. Reconnect." });
-  }
+  if (nonce !== ch.nonce) return res.status(400).json({ error: "Bad nonce. Reconnect." });
 
   try {
     const pubkeyBytes = bs58.decode(address);
@@ -205,28 +184,41 @@ router.post("/verify", async (req: Request, res: Response) => {
    TELEGRAM WEB APP AUTH
    POST /auth/telegram
    body: { initData }  // Telegram.WebApp.initData (raw querystring)
-   Returns: { token, address, profile, telegram }
    ========================================================= */
 
 function parseInitData(initData: string): Record<string, string> {
   const out: Record<string, string> = {};
-  let s = safeStr(initData);
+  let s = String(initData ?? "");
   if (!s) return out;
 
-  // Sometimes people accidentally pass "?a=b&c=d"
+  // Sometimes callers accidentally pass "?a=b&c=d"
   if (s.startsWith("?")) s = s.slice(1);
 
-  // ✅ URLSearchParams handles + and % decoding the way Telegram expects
+  // IMPORTANT: do NOT "decode then re-encode" initData.
+  // URLSearchParams gives us decoded key/value pairs (as Telegram expects for data_check_string).
   const usp = new URLSearchParams(s);
-  usp.forEach((v, k) => {
-    out[k] = v;
-  });
+  usp.forEach((v, k) => (out[k] = v));
   return out;
 }
 
 function buildDataCheckString(data: Record<string, string>) {
   const keys = Object.keys(data).filter((k) => k !== "hash").sort();
-  return { keys, dataCheckString: keys.map((k) => `${k}=${data[k]}`).join("\n") };
+  const dataCheckString = keys.map((k) => `${k}=${data[k]}`).join("\n");
+  return { keys, dataCheckString };
+}
+
+// ✅ Correct Telegram WebApp secret derivation
+function secretKey_WebAppData(botToken: string) {
+  return crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
+}
+
+// (Fallback) Older/other flows sometimes use sha256(botToken)
+function secretKey_Sha256Token(botToken: string) {
+  return crypto.createHash("sha256").update(botToken).digest();
+}
+
+function hmacHex(key: Buffer, msg: string) {
+  return crypto.createHmac("sha256", key).update(msg).digest("hex");
 }
 
 function verifyTelegramInitData(
@@ -234,42 +226,43 @@ function verifyTelegramInitData(
   botToken: string
 ): { ok: true; data: any } | { ok: false; error: string } {
   const data = parseInitData(initData);
-  const hash = data.hash;
-  if (!hash) return { ok: false, error: "missing_hash" };
+  const providedHash = data.hash;
+  if (!providedHash) return { ok: false, error: "missing_hash" };
 
   const { keys, dataCheckString } = buildDataCheckString(data);
 
-  // ✅ Per Telegram docs: secret_key = sha256(bot_token)
-  const secretKey = crypto.createHash("sha256").update(botToken).digest();
-  const computed = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
+  // ✅ Try correct WebApp method first
+  const computedWebApp = hmacHex(secretKey_WebAppData(botToken), dataCheckString);
+
+  // Fallback method (helps diagnose if someone mixed docs/flows)
+  const computedSha = hmacHex(secretKey_Sha256Token(botToken), dataCheckString);
+
+  const okWebApp = computedWebApp === providedHash;
+  const okSha = computedSha === providedHash;
 
   if (TG_DEBUG) {
-    console.log("[TG_VERIFY] initDataLen:", safeStr(initData).length);
+    console.log("[TG_VERIFY] initLen:", String(initData ?? "").length);
     console.log("[TG_VERIFY] keys:", keys.join(","));
     console.log("[TG_VERIFY] dataCheckString:\n" + dataCheckString);
-    console.log("[TG_VERIFY] providedHash:", hash);
-    console.log("[TG_VERIFY] computedHash:", computed);
-    console.log(
-      "[TG_VERIFY] botTokenLen:",
-      botToken.length,
-      "botTokenHasNewline:",
-      botToken.includes("\n") || botToken.includes("\r"),
-      "botTokenHasSpace:",
-      botToken.includes(" ")
-    );
+    console.log("[TG_VERIFY] providedHash:", providedHash);
+    console.log("[TG_VERIFY] computed(WebAppData):", computedWebApp);
+    console.log("[TG_VERIFY] computed(sha256token):", computedSha);
+    console.log("[TG_VERIFY] match webapp?", okWebApp, "match sha?", okSha);
   }
 
-  // ✅ Return actionable error that can surface on frontend toast
-  if (computed !== hash) {
+  if (!okWebApp && !okSha) {
+    // Keep toast readable: include short hashes + keycount
     return {
       ok: false,
-      error: `bad_hash|provided=${String(hash).slice(0, 12)}|computed=${String(computed).slice(
-        0,
-        12
-      )}|keys=${keys.length}|initLen=${safeStr(initData).length}`,
+      error:
+        `bad_hash|provided=${String(providedHash).slice(0, 12)}` +
+        `|webapp=${String(computedWebApp).slice(0, 12)}` +
+        `|sha=${String(computedSha).slice(0, 12)}` +
+        `|keys=${keys.length}|initLen=${String(initData ?? "").length}`,
     };
   }
 
+  // ✅ If one matches, continue
   const authDate = Number(data.auth_date || 0);
   if (!authDate) return { ok: false, error: "missing_auth_date" };
 
@@ -287,19 +280,15 @@ function verifyTelegramInitData(
   return { ok: true, data: { ...data, user } };
 }
 
-/**
- * POST /auth/telegram
- * body: { initData }
- */
 router.post("/telegram", async (req: Request, res: Response) => {
   try {
     if (!JWT_SECRET) return res.status(500).json({ error: "Server missing JWT_SECRET" });
     if (!TG_BOT_TOKEN) return res.status(500).json({ error: "Server missing TG_BOT_TOKEN" });
 
-    const initData = safeStr(req.body?.initData);
+    // IMPORTANT: do not trim initData; send/verify raw
+    const initData = String(req.body?.initData ?? "");
     if (!initData) return res.status(400).json({ error: "Missing initData" });
 
-    // ✅ Always verify with CLEAN token
     const v = verifyTelegramInitData(initData, TG_BOT_TOKEN);
     if (!v.ok) return res.status(401).json({ error: `tg_${v.error}` });
 
@@ -310,7 +299,6 @@ router.post("/telegram", async (req: Request, res: Response) => {
     const firstName = tgUser.first_name ? String(tgUser.first_name) : "";
     const lastName = tgUser.last_name ? String(tgUser.last_name) : "";
 
-    // Telegram-first identity
     const address = `tg:${tgIdNum}`;
 
     await upsertUser(address);
