@@ -1,9 +1,10 @@
+// src/auth.ts
 import { Router, Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import nacl from "tweetnacl";
 import bs58 from "bs58";
 import crypto from "crypto";
-import { upsertUser, setDisplayName } from "./db.js";
+import { upsertUser, getMe, setDisplayName, setTelegramIdentity } from "./db.js";
 
 const router = Router();
 
@@ -35,7 +36,7 @@ function signToken(address: string) {
   return jwt.sign({ address }, JWT_SECRET, { expiresIn: "30d" });
 }
 
-function safeAddress(a: string) {
+function safeStr(a: any) {
   return String(a || "").trim();
 }
 
@@ -45,7 +46,7 @@ function safeAddress(a: string) {
  * - base58 string (fallback)
  */
 function decodeSignature(sig: string): Uint8Array {
-  const s = String(sig || "").trim();
+  const s = safeStr(sig);
   if (!s) throw new Error("empty signature");
 
   // Heuristic: base64 often has + / = and is longer; base58 won't.
@@ -79,9 +80,30 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 /**
  * GET /auth/me
  * headers: Authorization: Bearer <token>
+ * ✅ returns profile info (display name + tg fields)
  */
-router.get("/me", requireAuth, (req: Request, res: Response) => {
-  return res.json({ address: (req as any).user?.address || null });
+router.get("/me", requireAuth, async (req: Request, res: Response) => {
+  const address = (req as any).user?.address || null;
+  if (!address) return res.json({ address: null });
+
+  try {
+    const me = await getMe(address);
+
+    return res.json({
+      ok: true,
+      address,
+      profile: {
+        displayName: me?.display_name || null,
+        tgId: me?.tg_id ?? null,
+        tgUsername: me?.tg_username ?? null,
+        tgFirstName: me?.tg_first_name ?? null,
+        tgLastName: me?.tg_last_name ?? null,
+      },
+    });
+  } catch (e) {
+    console.error("me error:", e);
+    return res.json({ ok: true, address, profile: { displayName: null } });
+  }
 });
 
 /**
@@ -89,13 +111,12 @@ router.get("/me", requireAuth, (req: Request, res: Response) => {
  * body: { address }
  */
 router.post("/challenge", async (req: Request, res: Response) => {
-  const address = safeAddress(req.body?.address);
+  const address = safeStr(req.body?.address);
   if (!address) return res.status(400).json({ error: "Missing address" });
 
   const nonce = randNonce();
   const nowIso = new Date().toISOString();
 
-  // Lore-friendly but still clear "sign-in only"
   const message =
     `PLANET FATNESS — GYM CHECK-IN\n` +
     `Wallet: ${address}\n` +
@@ -113,14 +134,13 @@ router.post("/challenge", async (req: Request, res: Response) => {
 /**
  * POST /auth/verify
  * body: { address, nonce, signature }
- * signature: base64 (recommended) OR base58 (fallback)
  */
 router.post("/verify", async (req: Request, res: Response) => {
   if (!JWT_SECRET) return res.status(500).json({ error: "Server missing JWT_SECRET" });
 
-  const address = safeAddress(req.body?.address);
-  const nonce = safeAddress(req.body?.nonce);
-  const signature = safeAddress(req.body?.signature);
+  const address = safeStr(req.body?.address);
+  const nonce = safeStr(req.body?.nonce);
+  const signature = safeStr(req.body?.signature);
 
   if (!address || !nonce || !signature) {
     return res.status(400).json({ error: "Missing fields" });
@@ -139,25 +159,18 @@ router.post("/verify", async (req: Request, res: Response) => {
   }
 
   try {
-    // Solana pubkey base58 -> 32 bytes
     const pubkeyBytes = bs58.decode(address);
-
-    // Signature decode (base64 or base58)
     const sigBytes = decodeSignature(signature);
-
-    // Message bytes
     const msgBytes = new TextEncoder().encode(ch.message);
 
     const ok = nacl.sign.detached.verify(msgBytes, sigBytes, pubkeyBytes);
     if (!ok) return res.status(401).json({ error: "Signature failed" });
 
-    // Ensure user exists
     await upsertUser(address);
-
     challenges.delete(address);
 
     const token = signToken(address);
-    return res.json({ token, address });
+    return res.json({ ok: true, token, address });
   } catch (e) {
     console.error("verify error:", e);
     return res.status(400).json({ error: "Verify error" });
@@ -168,15 +181,14 @@ router.post("/verify", async (req: Request, res: Response) => {
    TELEGRAM WEB APP AUTH
    POST /auth/telegram
    body: { initData }  // Telegram.WebApp.initData (raw querystring)
-   Returns: { token, address, telegram: {...}, displayName }
+   Returns: { token, address, profile, telegram }
    ========================================================= */
 
 function parseInitData(initData: string): Record<string, string> {
   const out: Record<string, string> = {};
-  const s = String(initData || "").trim();
+  const s = safeStr(initData);
   if (!s) return out;
 
-  // initData is querystring-like: key=value&key2=value2...
   const parts = s.split("&");
   for (const p of parts) {
     const eq = p.indexOf("=");
@@ -188,31 +200,28 @@ function parseInitData(initData: string): Record<string, string> {
   return out;
 }
 
-function verifyTelegramInitData(initData: string, botToken: string): { ok: true; data: any } | { ok: false; error: string } {
+function verifyTelegramInitData(
+  initData: string,
+  botToken: string
+): { ok: true; data: any } | { ok: false; error: string } {
   const data = parseInitData(initData);
   const hash = data.hash;
   if (!hash) return { ok: false, error: "missing_hash" };
 
-  // Build data_check_string: sorted "key=value" lines excluding hash
   const keys = Object.keys(data).filter((k) => k !== "hash").sort();
   const dataCheckString = keys.map((k) => `${k}=${data[k]}`).join("\n");
 
-  // secret_key = sha256(botToken)
   const secretKey = crypto.createHash("sha256").update(botToken).digest();
-
-  // HMAC_SHA256(data_check_string, secret_key) => hex
   const computed = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
 
   if (computed !== hash) return { ok: false, error: "bad_hash" };
 
-  // auth_date freshness check (optional but recommended)
   const authDate = Number(data.auth_date || 0);
   if (!authDate) return { ok: false, error: "missing_auth_date" };
 
   const ageSec = Math.floor(Date.now() / 1000) - authDate;
   if (TG_MAX_AGE_SEC > 0 && ageSec > TG_MAX_AGE_SEC) return { ok: false, error: "initdata_too_old" };
 
-  // user field is JSON
   let user: any = null;
   try {
     user = data.user ? JSON.parse(data.user) : null;
@@ -229,28 +238,38 @@ router.post("/telegram", async (req: Request, res: Response) => {
     if (!JWT_SECRET) return res.status(500).json({ error: "Server missing JWT_SECRET" });
     if (!TG_BOT_TOKEN) return res.status(500).json({ error: "Server missing TG_BOT_TOKEN" });
 
-    const initData = String(req.body?.initData || "").trim();
+    const initData = safeStr(req.body?.initData);
     if (!initData) return res.status(400).json({ error: "Missing initData" });
 
     const v = verifyTelegramInitData(initData, TG_BOT_TOKEN);
     if (!v.ok) return res.status(401).json({ error: `tg_${v.error}` });
 
     const tgUser = v.data.user as any;
-    const tgId = String(tgUser.id);
+
+    const tgIdNum = Number(tgUser.id);
     const username = tgUser.username ? String(tgUser.username) : "";
     const firstName = tgUser.first_name ? String(tgUser.first_name) : "";
     const lastName = tgUser.last_name ? String(tgUser.last_name) : "";
 
-    // Telegram-first identity "address" (fits your existing DB + JWT model)
-    const address = `tg:${tgId}`;
+    // Telegram-first identity (fits your existing JWT + DB model)
+    const address = `tg:${tgIdNum}`;
 
+    // Ensure user row exists, then write telegram fields
     await upsertUser(address);
+    await setTelegramIdentity({
+      address,
+      tgId: tgIdNum,
+      tgUsername: username || null,
+      firstName: firstName || null,
+      lastName: lastName || null,
+    });
 
-    // Prefer @username if available, otherwise fallback to first/last
+    // Optional: keep your existing "display_name" behavior
     const displayName =
-      username ? `@${username}` : [firstName, lastName].filter(Boolean).join(" ").slice(0, 24);
+      (username ? `@${username}` : "") ||
+      ([firstName, lastName].filter(Boolean).join(" ").trim().slice(0, 24)) ||
+      "Member";
 
-    // Only set if we have something usable
     if (displayName && displayName.trim().length >= 2) {
       try {
         await setDisplayName({ address, displayName });
@@ -260,12 +279,19 @@ router.post("/telegram", async (req: Request, res: Response) => {
     }
 
     const token = signToken(address);
+    const me = await getMe(address);
 
     return res.json({
       ok: true,
       token,
       address,
-      displayName: displayName || null,
+      profile: {
+        displayName: me?.display_name || displayName || null,
+        tgId: me?.tg_id ?? tgIdNum,
+        tgUsername: me?.tg_username ?? (username || null),
+        tgFirstName: me?.tg_first_name ?? (firstName || null),
+        tgLastName: me?.tg_last_name ?? (lastName || null),
+      },
       telegram: {
         id: tgUser.id,
         username: username || null,
