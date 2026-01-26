@@ -65,7 +65,18 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-// Per-game guardrails (tune later)
+// -------------------------------
+// CONSISTENT CALORIE CAPS ACROSS ALL GAMES
+// - Calories are protected by minDuration + per-minute cap + max-run cap + daily cap
+// - Basket HIGH SCORE is NOT capped (no maxScorePerRun); only score-rate anti-cheat affects calories
+// -------------------------------
+const COMMON_RULES = {
+  minDurationMs: 10_000,     // must play 10s to earn cals
+  maxRunCalories: 180,       // max cals per run (same across games)
+  dailyCapCalories: 1200,    // max cals per day per game (same across games)
+  cpmCap: 220,               // calories-per-minute ceiling guardrail
+};
+
 const RULES: Record<
   GameKey,
   {
@@ -76,10 +87,10 @@ const RULES: Record<
     maxScorePerRun: number;
   }
 > = {
-  runner: { minDurationMs: 12_000, maxRunCalories: 260, dailyCapCalories: 1_600, cpmCap: 220, maxScorePerRun: 0 },
-  snack:  { minDurationMs: 10_000, maxRunCalories: 190, dailyCapCalories: 1_200, cpmCap: 190, maxScorePerRun: 220 },
-  lift:   { minDurationMs: 10_000, maxRunCalories: 210, dailyCapCalories: 1_250, cpmCap: 200, maxScorePerRun: 260 },
-  basket: { minDurationMs: 10_000, maxRunCalories: 170, dailyCapCalories: 950,  cpmCap: 175, maxScorePerRun: 260 },
+  runner: { ...COMMON_RULES, maxScorePerRun: 0 },
+  snack:  { ...COMMON_RULES, maxScorePerRun: 0 },
+  lift:   { ...COMMON_RULES, maxScorePerRun: 0 },
+  basket: { ...COMMON_RULES, maxScorePerRun: 0 }, // ✅ no score cap
 };
 
 const DAILY_GOALS: Record<GameKey, { label: string; goal: number; metric: "score" | "miles" | "seconds" }> = {
@@ -137,8 +148,25 @@ function computeEarnedCalories(params: {
     return { earnedCalories: 0, reason: "too_short" as const, normalized: { score, miles, bestSeconds, durationMs } };
   }
 
-  if (rules.maxScorePerRun > 0 && score > rules.maxScorePerRun) {
-    return { earnedCalories: 0, reason: "score_too_high" as const, normalized: { score, miles, bestSeconds, durationMs } };
+  // ✅ Anti-cheat: cap SCORE RATE (points per minute), NOT total score.
+  // Allows unlimited basket streaks on legit longer runs; only blocks absurd score velocity.
+  if (game !== "runner") {
+    const scorePerMin = durationMin > 0 ? (score / durationMin) : score;
+
+    const SCORE_PER_MIN_CAP: Record<GameKey, number> = {
+      runner: 999999,
+      snack:  520,
+      lift:   450,
+      basket: 360, // tune later from real data
+    };
+
+    if (scorePerMin > SCORE_PER_MIN_CAP[game]) {
+      return {
+        earnedCalories: 0,
+        reason: "score_too_high" as const,
+        normalized: { score, miles, bestSeconds, durationMs },
+      };
+    }
   }
 
   let base = 0;
@@ -154,8 +182,8 @@ function computeEarnedCalories(params: {
     if (!miles || miles <= 0) base = durationMin * 120;
   }
 
-  const timeCap = durationMin * RULES[game].cpmCap;
-  const earnedCalories = Math.floor(clamp(base, 0, Math.min(timeCap, RULES[game].maxRunCalories)));
+  const timeCap = durationMin * rules.cpmCap;
+  const earnedCalories = Math.floor(clamp(base, 0, Math.min(timeCap, rules.maxRunCalories)));
 
   return { earnedCalories, reason: "ok" as const, normalized: { score, miles, bestSeconds, durationMs } };
 }
