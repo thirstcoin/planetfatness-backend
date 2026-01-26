@@ -30,11 +30,23 @@ export async function initDb() {
     );
   `);
 
-  // If users existed before, add column safely
+  // If users existed before, add column safely (legacy safety)
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS display_name TEXT;
   `);
+
+  // ✅ Telegram identity columns (used by /auth/tg + Gym Card)
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS tg_id BIGINT,
+    ADD COLUMN IF NOT EXISTS tg_username TEXT,
+    ADD COLUMN IF NOT EXISTS tg_first_name TEXT,
+    ADD COLUMN IF NOT EXISTS tg_last_name TEXT;
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_username ON users(tg_username);`);
 
   // Sessions table = receipts (per-run logging)
   await pool.query(`
@@ -111,6 +123,54 @@ export async function setDisplayName(params: { address: string; displayName: str
 }
 
 /**
+ * ✅ Telegram identity attach/update
+ * address should be "tg:<id>" for telegram-first users
+ */
+export async function setTelegramIdentity(params: {
+  address: string;
+  tgId: number;
+  tgUsername?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+}) {
+  const address = String(params.address || "").trim();
+  const tgId = Number(params.tgId || 0);
+
+  const tgUsername = params.tgUsername ? String(params.tgUsername).trim().replace(/^@/, "") : null;
+  const firstName = params.firstName ? String(params.firstName).trim() : null;
+  const lastName = params.lastName ? String(params.lastName).trim() : null;
+
+  if (!address) throw new Error("missing address");
+  if (!tgId) throw new Error("missing tgId");
+
+  // default display name (only set if none exists)
+  const fallbackDisplayName =
+    (tgUsername ? `@${tgUsername}` : null) ||
+    ([firstName, lastName].filter(Boolean).join(" ").trim() || null) ||
+    "Member";
+
+  await upsertUser(address);
+
+  const r = await pool.query(
+    `
+    UPDATE users
+    SET
+      tg_id = $2,
+      tg_username = $3,
+      tg_first_name = $4,
+      tg_last_name = $5,
+      display_name = COALESCE(NULLIF(display_name,''), $6),
+      updated_at = NOW()
+    WHERE address = $1
+    RETURNING *;
+    `,
+    [address, tgId, tgUsername, firstName, lastName, fallbackDisplayName]
+  );
+
+  return r.rows[0] || null;
+}
+
+/**
  * addActivity updates lifetime totals.
  * - total_calories += addCalories
  * - total_miles += addMiles
@@ -133,7 +193,7 @@ export async function addActivity(params: { address: string; addCalories: number
     SET
       total_calories = total_calories + $2,
       total_miles = total_miles + $3,
-      best_seconds = GREATEST(best_seconds, best_seconds, $4),
+      best_seconds = GREATEST(best_seconds, $4),
       updated_at = NOW()
     WHERE address = $1
     RETURNING *;
@@ -356,6 +416,8 @@ export async function getActivitySummary(params: { address: string }) {
     address,
     profile: {
       displayName: me?.display_name || null,
+      tgId: me?.tg_id ?? null,
+      tgUsername: me?.tg_username ?? null,
     },
     lifetime: {
       totalCalories: Number(me?.total_calories || 0),
