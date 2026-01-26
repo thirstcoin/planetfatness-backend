@@ -133,7 +133,7 @@ export async function addActivity(params: { address: string; addCalories: number
     SET
       total_calories = total_calories + $2,
       total_miles = total_miles + $3,
-      best_seconds = GREATEST(best_seconds, $4),
+      best_seconds = GREATEST(best_seconds, best_seconds, $4),
       updated_at = NOW()
     WHERE address = $1
     RETURNING *;
@@ -203,6 +203,8 @@ export async function logSession(params: {
 // window: lifetime | day | week | month
 // metric: calories | score | miles | duration
 // optional game filter
+//
+// ✅ Change: basket score leaderboard uses MAX(score) (high score), not SUM(score)
 // -------------------------------
 export async function getLeaderboardV2(params: {
   window: "lifetime" | "day" | "week" | "month" | string;
@@ -227,7 +229,10 @@ export async function getLeaderboardV2(params: {
 
   // metric selector
   let metricExpr = "SUM(calories)";
-  if (metric === "score") metricExpr = "SUM(score)";
+  if (metric === "score") {
+    // Basket = high score board
+    metricExpr = game === "basket" ? "MAX(score)" : "SUM(score)";
+  }
   if (metric === "miles") metricExpr = "SUM(miles)";
   if (metric === "duration") metricExpr = "SUM(duration_ms)";
 
@@ -258,11 +263,12 @@ export async function getLeaderboardV2(params: {
     SELECT
       s.address,
       u.display_name,
-      ${metricExpr}::DOUBLE PRECISION AS value,
+      (${metricExpr})::DOUBLE PRECISION AS value,
       SUM(s.calories)::DOUBLE PRECISION AS calories,
       SUM(s.miles)::DOUBLE PRECISION AS miles,
       SUM(s.score)::DOUBLE PRECISION AS score,
-      SUM(s.duration_ms)::DOUBLE PRECISION AS duration_ms
+      SUM(s.duration_ms)::DOUBLE PRECISION AS duration_ms,
+      MAX(s.score)::DOUBLE PRECISION AS best_score
     FROM sessions s
     LEFT JOIN users u ON u.address = s.address
     WHERE 1=1
