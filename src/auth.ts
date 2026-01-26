@@ -8,22 +8,43 @@ import { upsertUser, getMe, setDisplayName, setTelegramIdentity } from "./db.js"
 
 const router = Router();
 
-const JWT_SECRET = process.env.JWT_SECRET || "";
+const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
 if (!JWT_SECRET) {
   console.warn("⚠️ Missing JWT_SECRET (set it in Render env vars). Auth verify will fail.");
 }
 
-// Telegram Bot Token (from BotFather) for verifying WebApp initData
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
+/**
+ * ✅ Telegram Bot Token (from BotFather)
+ * Most common tg_bad_hash cause: token has trailing newline/space or accidental quotes in env.
+ * We hard-clean it here.
+ */
+const TG_BOT_TOKEN = String(process.env.TG_BOT_TOKEN || "")
+  .trim()
+  .replace(/^\s+|\s+$/g, "")
+  .replace(/^"+|"+$/g, "") // strip accidental quotes
+  .replace(/^'+|'+$/g, ""); // strip accidental quotes
+
 if (!TG_BOT_TOKEN) {
   console.warn("⚠️ Missing TG_BOT_TOKEN. /auth/telegram will fail until you set it.");
+} else {
+  // Safe diagnostics (does NOT print the token)
+  const hasNewline = TG_BOT_TOKEN.includes("\n") || TG_BOT_TOKEN.includes("\r");
+  const hasSpace = TG_BOT_TOKEN.includes(" ");
+  console.log(
+    "[TG] TG_BOT_TOKEN len:",
+    TG_BOT_TOKEN.length,
+    "has_newline:",
+    hasNewline,
+    "has_space:",
+    hasSpace
+  );
 }
 
 // Optional: how old initData can be (seconds). Default 1 day.
 const TG_MAX_AGE_SEC = Number(process.env.TG_MAX_AGE_SEC || 86400);
 
-// Optional debug logs (set to "1" in Render to see TG verify details)
-const TG_DEBUG = (process.env.TG_DEBUG || "").trim() === "1";
+// Optional debug logs (set TG_DEBUG=1 in Render to see TG verify details)
+const TG_DEBUG = String(process.env.TG_DEBUG || "").trim() === "1";
 
 type Challenge = { nonce: string; message: string; exp: number };
 const challenges = new Map<string, Challenge>();
@@ -205,7 +226,7 @@ function parseInitData(initData: string): Record<string, string> {
 
 function buildDataCheckString(data: Record<string, string>) {
   const keys = Object.keys(data).filter((k) => k !== "hash").sort();
-  return keys.map((k) => `${k}=${data[k]}`).join("\n");
+  return { keys, dataCheckString: keys.map((k) => `${k}=${data[k]}`).join("\n") };
 }
 
 function verifyTelegramInitData(
@@ -216,21 +237,38 @@ function verifyTelegramInitData(
   const hash = data.hash;
   if (!hash) return { ok: false, error: "missing_hash" };
 
-  const dataCheckString = buildDataCheckString(data);
+  const { keys, dataCheckString } = buildDataCheckString(data);
 
-  // Per Telegram docs: secret_key = sha256(bot_token)
+  // ✅ Per Telegram docs: secret_key = sha256(bot_token)
   const secretKey = crypto.createHash("sha256").update(botToken).digest();
   const computed = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
 
   if (TG_DEBUG) {
-    console.log("[TG_VERIFY] keys:", Object.keys(data).sort().join(","));
-    console.log("[TG_VERIFY] initData len:", safeStr(initData).length);
-    console.log("[TG_VERIFY] dataCheckString:", dataCheckString);
-    console.log("[TG_VERIFY] hash:", hash);
-    console.log("[TG_VERIFY] computed:", computed);
+    console.log("[TG_VERIFY] initDataLen:", safeStr(initData).length);
+    console.log("[TG_VERIFY] keys:", keys.join(","));
+    console.log("[TG_VERIFY] dataCheckString:\n" + dataCheckString);
+    console.log("[TG_VERIFY] providedHash:", hash);
+    console.log("[TG_VERIFY] computedHash:", computed);
+    console.log(
+      "[TG_VERIFY] botTokenLen:",
+      botToken.length,
+      "botTokenHasNewline:",
+      botToken.includes("\n") || botToken.includes("\r"),
+      "botTokenHasSpace:",
+      botToken.includes(" ")
+    );
   }
 
-  if (computed !== hash) return { ok: false, error: "bad_hash" };
+  // ✅ Return actionable error that can surface on frontend toast
+  if (computed !== hash) {
+    return {
+      ok: false,
+      error: `bad_hash|provided=${String(hash).slice(0, 12)}|computed=${String(computed).slice(
+        0,
+        12
+      )}|keys=${keys.length}|initLen=${safeStr(initData).length}`,
+    };
+  }
 
   const authDate = Number(data.auth_date || 0);
   if (!authDate) return { ok: false, error: "missing_auth_date" };
@@ -249,6 +287,10 @@ function verifyTelegramInitData(
   return { ok: true, data: { ...data, user } };
 }
 
+/**
+ * POST /auth/telegram
+ * body: { initData }
+ */
 router.post("/telegram", async (req: Request, res: Response) => {
   try {
     if (!JWT_SECRET) return res.status(500).json({ error: "Server missing JWT_SECRET" });
@@ -257,6 +299,7 @@ router.post("/telegram", async (req: Request, res: Response) => {
     const initData = safeStr(req.body?.initData);
     if (!initData) return res.status(400).json({ error: "Missing initData" });
 
+    // ✅ Always verify with CLEAN token
     const v = verifyTelegramInitData(initData, TG_BOT_TOKEN);
     if (!v.ok) return res.status(401).json({ error: `tg_${v.error}` });
 
