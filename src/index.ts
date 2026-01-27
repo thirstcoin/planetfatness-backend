@@ -65,6 +65,20 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+/**
+ * ✅ Window aliases for frontend convenience
+ * Hub can use: daily/weekly/monthly/lifetime
+ * Backend internally uses: day/week/month/lifetime
+ */
+function normalizeWindow(w: any): "lifetime" | "day" | "week" | "month" {
+  const s = String(w || "lifetime").toLowerCase().trim();
+  if (s === "daily") return "day";
+  if (s === "weekly") return "week";
+  if (s === "monthly") return "month";
+  if (s === "day" || s === "week" || s === "month" || s === "lifetime") return s;
+  return "lifetime";
+}
+
 // -------------------------------
 // CONSISTENT CALORIE CAPS ACROSS ALL GAMES
 // - Calories are protected by minDuration + per-minute cap + max-run cap + daily cap
@@ -228,6 +242,7 @@ app.get("/", (_req: Request, res: Response) => {
         "  GET  /daily/progress       (auth)",
         "  GET  /leaderboard",
         "  GET  /leaderboard/v2       (window=day|week|month|lifetime)",
+        "  GET  /leaderboard/games    (window=day|week|month|lifetime)  [NEW]",
         "",
         "tapping counts as cardio 🟣🟡",
       ].join("\n")
@@ -526,13 +541,13 @@ app.get("/leaderboard", async (_req: Request, res: Response) => {
 /**
  * GET /leaderboard/v2
  * query:
- *  window = lifetime | day | week | month
+ *  window = lifetime | day | week | month  (also accepts daily|weekly|monthly)
  *  metric = calories | score | miles | duration
  *  game   = runner | snack | lift | basket (optional)
  */
 app.get("/leaderboard/v2", async (req: Request, res: Response) => {
   try {
-    const window = String(req.query.window || "lifetime") as any;
+    const window = normalizeWindow(req.query.window || "lifetime") as any;
     const metric = String(req.query.metric || "calories") as any;
     const game = req.query.game ? String(req.query.game) : undefined;
     const limit = req.query.limit ? Number(req.query.limit) : 30;
@@ -542,6 +557,40 @@ app.get("/leaderboard/v2", async (req: Request, res: Response) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Leaderboard v2 failed" });
+  }
+});
+
+/**
+ * ✅ NEW: GET /leaderboard/games
+ * One call returns Top N by SCORE for each game for a given window.
+ * query:
+ *  window = lifetime|day|week|month (also daily/weekly/monthly)
+ *  limit  = number (default 3)
+ */
+app.get("/leaderboard/games", async (req: Request, res: Response) => {
+  try {
+    const window = normalizeWindow(req.query.window || "lifetime");
+    const limit = req.query.limit ? Number(req.query.limit) : 3;
+
+    const games: GameKey[] = ["runner", "snack", "lift", "basket"];
+
+    const out: any = { ok: true, window, limit, games: {} as any };
+
+    for (const g of games) {
+      // Top by SCORE for that game/window
+      const rows = await getLeaderboardV2({
+        window,
+        metric: "score",
+        game: g,
+        limit: Math.max(1, Math.min(50, Number(limit) || 3)),
+      });
+      out.games[g] = rows;
+    }
+
+    res.json(out);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Leaderboard games failed" });
   }
 });
 
