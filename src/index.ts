@@ -85,10 +85,10 @@ function normalizeWindow(w: any): "lifetime" | "day" | "week" | "month" {
 // - Basket HIGH SCORE is NOT capped (no maxScorePerRun); only score-rate anti-cheat affects calories
 // -------------------------------
 const COMMON_RULES = {
-  minDurationMs: 10_000,     // must play 10s to earn cals
-  maxRunCalories: 180,       // max cals per run (same across games)
-  dailyCapCalories: 1200,    // max cals per day per game (same across games)
-  cpmCap: 220,               // calories-per-minute ceiling guardrail
+  minDurationMs: 10_000, // must play 10s to earn cals
+  maxRunCalories: 180, // max cals per run (same across games)
+  dailyCapCalories: 1200, // max cals per day per game (same across games)
+  cpmCap: 220, // calories-per-minute ceiling guardrail
 };
 
 const RULES: Record<
@@ -102,15 +102,15 @@ const RULES: Record<
   }
 > = {
   runner: { ...COMMON_RULES, maxScorePerRun: 0 },
-  snack:  { ...COMMON_RULES, maxScorePerRun: 0 },
-  lift:   { ...COMMON_RULES, maxScorePerRun: 0 },
+  snack: { ...COMMON_RULES, maxScorePerRun: 0 },
+  lift: { ...COMMON_RULES, maxScorePerRun: 0 },
   basket: { ...COMMON_RULES, maxScorePerRun: 0 }, // ✅ no score cap
 };
 
 const DAILY_GOALS: Record<GameKey, { label: string; goal: number; metric: "score" | "miles" | "seconds" }> = {
-  snack:  { label: "Daily Goal", goal: 30, metric: "score" },
-  runner: { label: "Daily Goal", goal: 1,  metric: "miles" },
-  lift:   { label: "Daily Goal", goal: 50, metric: "score" },
+  snack: { label: "Daily Goal", goal: 30, metric: "score" },
+  runner: { label: "Daily Goal", goal: 1, metric: "miles" },
+  lift: { label: "Daily Goal", goal: 50, metric: "score" },
   basket: { label: "Daily Goal", goal: 20, metric: "score" },
 };
 
@@ -141,13 +141,7 @@ async function getTodayAgg(address: string, game: GameKey) {
   };
 }
 
-function computeEarnedCalories(params: {
-  game: GameKey;
-  score: number;
-  miles: number;
-  bestSeconds: number;
-  durationMs: number;
-}) {
+function computeEarnedCalories(params: { game: GameKey; score: number; miles: number; bestSeconds: number; durationMs: number }) {
   const { game } = params;
   const rules = RULES[game];
 
@@ -165,12 +159,12 @@ function computeEarnedCalories(params: {
   // ✅ Anti-cheat: cap SCORE RATE (points per minute), NOT total score.
   // Allows unlimited basket streaks on legit longer runs; only blocks absurd score velocity.
   if (game !== "runner") {
-    const scorePerMin = durationMin > 0 ? (score / durationMin) : score;
+    const scorePerMin = durationMin > 0 ? score / durationMin : score;
 
     const SCORE_PER_MIN_CAP: Record<GameKey, number> = {
       runner: 999999,
-      snack:  520,
-      lift:   450,
+      snack: 520,
+      lift: 450,
       basket: 360, // tune later from real data
     };
 
@@ -202,10 +196,7 @@ function computeEarnedCalories(params: {
   return { earnedCalories, reason: "ok" as const, normalized: { score, miles, bestSeconds, durationMs } };
 }
 
-function computeDailyGoalProgress(params: {
-  game: GameKey;
-  today: { score: number; miles: number; durationMs: number };
-}) {
+function computeDailyGoalProgress(params: { game: GameKey; today: { score: number; miles: number; durationMs: number } }) {
   const g = DAILY_GOALS[params.game];
   if (!g) return { goal: 0, progress: 0, hit: false };
 
@@ -233,8 +224,8 @@ app.get("/", (_req: Request, res: Response) => {
         "Endpoints:",
         "  GET  /health",
         "  POST /auth/*",
-        "  GET  /profile/me           (auth)   [NEW]",
-        "  POST /profile/name         (auth)   [NEW]",
+        "  GET  /profile/me           (auth)",
+        "  POST /profile/name         (auth)",
         "  GET  /activity/me          (auth)",
         "  POST /activity/add         (auth)   [legacy + optional receipts]",
         "  POST /activity/submit      (auth)   [server-computed calories]",
@@ -242,7 +233,7 @@ app.get("/", (_req: Request, res: Response) => {
         "  GET  /daily/progress       (auth)",
         "  GET  /leaderboard",
         "  GET  /leaderboard/v2       (window=day|week|month|lifetime)",
-        "  GET  /leaderboard/games    (window=day|week|month|lifetime)  [NEW]",
+        "  GET  /leaderboard/games    (window=day|week|month|lifetime)",
         "",
         "tapping counts as cardio 🟣🟡",
       ].join("\n")
@@ -260,7 +251,7 @@ app.get("/health", (_req: Request, res: Response) =>
 app.use("/auth", authRouter);
 
 /**
- * NEW: GET /profile/me (auth)
+ * GET /profile/me (auth)
  */
 app.get("/profile/me", requireAuth, async (req: Request, res: Response) => {
   const address = (req as any).user?.address as string;
@@ -274,7 +265,7 @@ app.get("/profile/me", requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * NEW: POST /profile/name (auth)
+ * POST /profile/name (auth)
  * body: { displayName }
  */
 app.post("/profile/name", requireAuth, async (req: Request, res: Response) => {
@@ -296,7 +287,6 @@ app.post("/profile/name", requireAuth, async (req: Request, res: Response) => {
 
 /**
  * GET /activity/me (auth)
- * returns: { address, displayName, totalCalories, bestSeconds, totalMiles }
  */
 app.get("/activity/me", requireAuth, async (req: Request, res: Response) => {
   const address = (req as any).user?.address as string;
@@ -382,6 +372,7 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
   const v2BestSeconds = req.body?.bestSeconds != null ? Number(req.body.bestSeconds) : undefined;
   const v2Score = req.body?.score != null ? Number(req.body.score) : undefined;
   const v2DurationMs = req.body?.durationMs != null ? Number(req.body.durationMs) : undefined;
+  const v2Streak = req.body?.streak != null ? Number(req.body.streak) : undefined; // ✅ NEW (optional)
 
   // Aliases (v2 wins if present)
   const finalAddCalories = Number.isFinite(v2Calories as any) ? Number(v2Calories) : legacyAddCalories;
@@ -389,6 +380,7 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
   const finalBestSeconds = Number.isFinite(v2BestSeconds as any) ? Number(v2BestSeconds) : legacyBestSeconds;
   const finalScore = Number.isFinite(v2Score as any) ? Number(v2Score) : 0;
   const finalDurationMs = Number.isFinite(v2DurationMs as any) ? Math.max(0, Math.floor(Number(v2DurationMs))) : 0;
+  const finalStreak = Number.isFinite(v2Streak as any) ? Math.max(0, Math.floor(Number(v2Streak))) : 0;
 
   // 1) Update lifetime rollups
   const me = await addActivity({
@@ -417,6 +409,7 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
         miles: Math.max(0, Number(finalAddMiles || 0)),
         bestSeconds: Math.max(0, Number(finalBestSeconds || 0)),
         score: Math.max(0, Number(finalScore || 0)),
+        streak: finalStreak, // ✅ NEW
         durationMs: Math.max(0, Math.floor(finalDurationMs || 0)),
       });
     } catch (e) {
@@ -447,6 +440,9 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
     const bestSeconds = Number(req.body?.bestSeconds ?? 0);
     const durationMs = Number(req.body?.durationMs ?? 0);
 
+    // ✅ NEW: optional streak (used by basket “one miss ends run”)
+    const streak = Math.max(0, Math.floor(Number(req.body?.streak ?? 0) || 0));
+
     if (!Number.isFinite(durationMs) || durationMs <= 0) {
       return res.status(400).json({ error: "Missing durationMs" });
     }
@@ -467,7 +463,7 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
     const remaining = Math.max(0, rules.dailyCapCalories - todayBefore.calories);
     const earnedCapped = Math.max(0, Math.min(calc.earnedCalories, remaining));
 
-    // 3) log receipt
+    // 3) log receipt (✅ includes streak)
     await logSession({
       address,
       game,
@@ -475,6 +471,7 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
       miles: Math.max(0, miles || 0),
       bestSeconds: Math.max(0, bestSeconds || 0),
       score: Math.max(0, score || 0),
+      streak, // ✅ NEW
       durationMs: Math.max(0, Math.floor(durationMs || 0)),
     });
 
@@ -542,7 +539,7 @@ app.get("/leaderboard", async (_req: Request, res: Response) => {
  * GET /leaderboard/v2
  * query:
  *  window = lifetime | day | week | month  (also accepts daily|weekly|monthly)
- *  metric = calories | score | miles | duration
+ *  metric = calories | score | miles | duration | streak
  *  game   = runner | snack | lift | basket (optional)
  */
 app.get("/leaderboard/v2", async (req: Request, res: Response) => {
@@ -561,11 +558,8 @@ app.get("/leaderboard/v2", async (req: Request, res: Response) => {
 });
 
 /**
- * ✅ NEW: GET /leaderboard/games
+ * GET /leaderboard/games
  * One call returns Top N by SCORE for each game for a given window.
- * query:
- *  window = lifetime|day|week|month (also daily/weekly/monthly)
- *  limit  = number (default 3)
  */
 app.get("/leaderboard/games", async (req: Request, res: Response) => {
   try {
@@ -577,7 +571,6 @@ app.get("/leaderboard/games", async (req: Request, res: Response) => {
     const out: any = { ok: true, window, limit, games: {} as any };
 
     for (const g of games) {
-      // Top by SCORE for that game/window
       const rows = await getLeaderboardV2({
         window,
         metric: "score",
