@@ -224,7 +224,7 @@ export async function logSession(params: {
   bestSeconds: number;
   score: number;
   durationMs: number;
-  streak?: number; // ✅ NEW
+  streak?: number;
 }) {
   const address = String(params.address || "").trim();
   const game = String(params.game || "unknown").trim().slice(0, 32);
@@ -234,7 +234,7 @@ export async function logSession(params: {
   const bestSeconds = Math.max(0, Number(params.bestSeconds || 0));
   const score = Math.max(0, Math.floor(Number(params.score || 0)));
   const durationMs = Math.max(0, Math.floor(Number(params.durationMs || 0)));
-  const streak = Math.max(0, Math.floor(Number(params.streak || 0))); // ✅ NEW
+  const streak = Math.max(0, Math.floor(Number(params.streak || 0)));
 
   if (!address) throw new Error("missing address");
 
@@ -258,8 +258,9 @@ export async function logSession(params: {
 // metric: calories | score | miles | duration | streak
 // optional game filter
 //
-// ✅ Basket score uses MAX(score) (high score), not SUM(score)
-// ✅ Basket streak uses MAX(streak) (best streak), not SUM(streak)
+// ✅ Basket score should be BEST RUN (MAX(score))
+// ✅ Basket streak should be BEST STREAK (MAX(streak))
+// ✅ Optional grind stat: shots_made = SUM(score)
 // -------------------------------
 export async function getLeaderboardV2(params: {
   window: "lifetime" | "day" | "week" | "month" | string;
@@ -273,24 +274,15 @@ export async function getLeaderboardV2(params: {
   const limit = Math.max(1, Math.min(200, Number(params.limit || 30)));
 
   let whereTime = "";
-  if (window === "day") whereTime = `AND created_at >= date_trunc('day', NOW())`;
-  if (window === "week") whereTime = `AND created_at >= date_trunc('week', NOW())`;
-  if (window === "month") whereTime = `AND created_at >= date_trunc('month', NOW())`;
+  if (window === "day") whereTime = `AND s.created_at >= date_trunc('day', NOW())`;
+  if (window === "week") whereTime = `AND s.created_at >= date_trunc('week', NOW())`;
+  if (window === "month") whereTime = `AND s.created_at >= date_trunc('month', NOW())`;
 
-  const whereGame = game ? `AND game = $2` : "";
+  const whereGame = game ? `AND s.game = $2` : "";
   const args: any[] = [limit];
   if (game) args.push(game);
 
-  let metricExpr = "SUM(calories)";
-  if (metric === "score") {
-    metricExpr = game === "basket" ? "MAX(score)" : "SUM(score)";
-  }
-  if (metric === "streak") {
-    metricExpr = game === "basket" ? "MAX(streak)" : "MAX(streak)";
-  }
-  if (metric === "miles") metricExpr = "SUM(miles)";
-  if (metric === "duration") metricExpr = "SUM(duration_ms)";
-
+  // lifetime user rollups for calories/miles remain fast + clean
   if (window === "lifetime" && (metric === "calories" || metric === "miles")) {
     const col = metric === "miles" ? "total_miles" : "total_calories";
     const r = await pool.query(
@@ -311,18 +303,38 @@ export async function getLeaderboardV2(params: {
     return r.rows || [];
   }
 
+  // Important: when game=basket, return "score" as MAX(score) so frontend never accidentally shows SUM(score).
+  const isBasket = game === "basket";
+
+  // value expression (metric-specific)
+  let metricExpr = "SUM(s.calories)";
+  if (metric === "score") metricExpr = isBasket ? "MAX(s.score)" : "SUM(s.score)";
+  if (metric === "streak") metricExpr = "MAX(s.streak)";
+  if (metric === "miles") metricExpr = "SUM(s.miles)";
+  if (metric === "duration") metricExpr = "SUM(s.duration_ms)";
+
+  // per-row fields
+  const scoreField = isBasket ? "MAX(s.score)" : "SUM(s.score)";
+  const streakField = "MAX(s.streak)";
+  const shotsMadeField = "SUM(s.score)"; // grind stat (optional)
+
   const r = await pool.query(
     `
     SELECT
       s.address,
       u.display_name,
+
       (${metricExpr})::DOUBLE PRECISION AS value,
+
       SUM(s.calories)::DOUBLE PRECISION AS calories,
       SUM(s.miles)::DOUBLE PRECISION AS miles,
-      SUM(s.score)::DOUBLE PRECISION AS score,
+      (${scoreField})::DOUBLE PRECISION AS score,
       SUM(s.duration_ms)::DOUBLE PRECISION AS duration_ms,
+
       MAX(s.score)::DOUBLE PRECISION AS best_score,
-      MAX(s.streak)::DOUBLE PRECISION AS best_streak
+      MAX(s.streak)::DOUBLE PRECISION AS best_streak,
+
+      (${shotsMadeField})::DOUBLE PRECISION AS shots_made
     FROM sessions s
     LEFT JOIN users u ON u.address = s.address
     WHERE 1=1
@@ -347,11 +359,14 @@ export async function getActivitySummary(params: { address: string }) {
 
   const me = await getMe(address);
 
+  // score = total score across all sessions in window
+  // best_score = best single-run score (what basket should display as “Score” if you want best-run)
   const day = await pool.query(
     `
     SELECT
       COALESCE(SUM(calories),0) AS calories,
       COALESCE(SUM(score),0) AS score,
+      COALESCE(MAX(score),0) AS best_score,
       COALESCE(MAX(streak),0) AS best_streak,
       COALESCE(SUM(miles),0) AS miles,
       COALESCE(SUM(duration_ms),0) AS duration_ms
@@ -367,6 +382,7 @@ export async function getActivitySummary(params: { address: string }) {
     SELECT
       COALESCE(SUM(calories),0) AS calories,
       COALESCE(SUM(score),0) AS score,
+      COALESCE(MAX(score),0) AS best_score,
       COALESCE(MAX(streak),0) AS best_streak,
       COALESCE(SUM(miles),0) AS miles,
       COALESCE(SUM(duration_ms),0) AS duration_ms
@@ -382,6 +398,7 @@ export async function getActivitySummary(params: { address: string }) {
     SELECT
       COALESCE(SUM(calories),0) AS calories,
       COALESCE(SUM(score),0) AS score,
+      COALESCE(MAX(score),0) AS best_score,
       COALESCE(MAX(streak),0) AS best_streak,
       COALESCE(SUM(miles),0) AS miles,
       COALESCE(SUM(duration_ms),0) AS duration_ms
@@ -398,6 +415,7 @@ export async function getActivitySummary(params: { address: string }) {
       game,
       COALESCE(SUM(calories),0) AS calories,
       COALESCE(SUM(score),0) AS score,
+      COALESCE(MAX(score),0) AS best_score,
       COALESCE(MAX(streak),0) AS best_streak,
       COALESCE(SUM(miles),0) AS miles,
       COALESCE(SUM(duration_ms),0) AS duration_ms
@@ -409,6 +427,10 @@ export async function getActivitySummary(params: { address: string }) {
     `,
     [address]
   );
+
+  const d = day.rows[0] || {};
+  const w = week.rows[0] || {};
+  const m = month.rows[0] || {};
 
   return {
     address,
@@ -423,30 +445,34 @@ export async function getActivitySummary(params: { address: string }) {
       bestSeconds: Number(me?.best_seconds || 0),
     },
     today: {
-      calories: Number(day.rows[0]?.calories || 0),
-      score: Number(day.rows[0]?.score || 0),
-      bestStreak: Number(day.rows[0]?.best_streak || 0),
-      miles: Number(day.rows[0]?.miles || 0),
-      durationMs: Number(day.rows[0]?.duration_ms || 0),
+      calories: Number(d.calories || 0),
+      score: Number(d.score || 0),
+      bestScore: Number(d.best_score || 0),
+      bestStreak: Number(d.best_streak || 0),
+      miles: Number(d.miles || 0),
+      durationMs: Number(d.duration_ms || 0),
     },
     week: {
-      calories: Number(week.rows[0]?.calories || 0),
-      score: Number(week.rows[0]?.score || 0),
-      bestStreak: Number(week.rows[0]?.best_streak || 0),
-      miles: Number(week.rows[0]?.miles || 0),
-      durationMs: Number(week.rows[0]?.duration_ms || 0),
+      calories: Number(w.calories || 0),
+      score: Number(w.score || 0),
+      bestScore: Number(w.best_score || 0),
+      bestStreak: Number(w.best_streak || 0),
+      miles: Number(w.miles || 0),
+      durationMs: Number(w.duration_ms || 0),
     },
     month: {
-      calories: Number(month.rows[0]?.calories || 0),
-      score: Number(month.rows[0]?.score || 0),
-      bestStreak: Number(month.rows[0]?.best_streak || 0),
-      miles: Number(month.rows[0]?.miles || 0),
-      durationMs: Number(month.rows[0]?.duration_ms || 0),
+      calories: Number(m.calories || 0),
+      score: Number(m.score || 0),
+      bestScore: Number(m.best_score || 0),
+      bestStreak: Number(m.best_streak || 0),
+      miles: Number(m.miles || 0),
+      durationMs: Number(m.duration_ms || 0),
     },
     last30DaysByGame: (byGame.rows || []).map((r: any) => ({
       game: r.game,
       calories: Number(r.calories || 0),
       score: Number(r.score || 0),
+      bestScore: Number(r.best_score || 0),
       bestStreak: Number(r.best_streak || 0),
       miles: Number(r.miles || 0),
       durationMs: Number(r.duration_ms || 0),
