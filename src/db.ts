@@ -30,13 +30,12 @@ export async function initDb() {
     );
   `);
 
-  // If users existed before, add column safely (legacy safety)
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS display_name TEXT;
   `);
 
-  // ✅ Telegram identity columns (used by /auth/tg + Gym Card)
+  // ✅ Telegram identity columns
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS tg_id BIGINT,
@@ -61,6 +60,12 @@ export async function initDb() {
       duration_ms INT NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  // ✅ NEW: streak column for games like basket (one miss ends run)
+  await pool.query(`
+    ALTER TABLE sessions
+    ADD COLUMN IF NOT EXISTS streak INT NOT NULL DEFAULT 0;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_address_created ON sessions(address, created_at DESC);`);
@@ -102,7 +107,6 @@ export async function setDisplayName(params: { address: string; displayName: str
 
   if (!address) throw new Error("missing address");
 
-  // basic sanitation + length cap
   displayName = displayName.replace(/\s+/g, " ").slice(0, 24);
   if (displayName.length < 2) throw new Error("displayName_too_short");
 
@@ -122,10 +126,6 @@ export async function setDisplayName(params: { address: string; displayName: str
   return r.rows[0] || null;
 }
 
-/**
- * ✅ Telegram identity attach/update
- * address should be "tg:<id>" for telegram-first users
- */
 export async function setTelegramIdentity(params: {
   address: string;
   tgId: number;
@@ -143,7 +143,6 @@ export async function setTelegramIdentity(params: {
   if (!address) throw new Error("missing address");
   if (!tgId) throw new Error("missing tgId");
 
-  // default display name (only set if none exists)
   const fallbackDisplayName =
     (tgUsername ? `@${tgUsername}` : null) ||
     ([firstName, lastName].filter(Boolean).join(" ").trim() || null) ||
@@ -170,12 +169,6 @@ export async function setTelegramIdentity(params: {
   return r.rows[0] || null;
 }
 
-/**
- * addActivity updates lifetime totals.
- * - total_calories += addCalories
- * - total_miles += addMiles
- * - best_seconds = max(best_seconds, bestSeconds)
- */
 export async function addActivity(params: { address: string; addCalories: number; bestSeconds: number; addMiles: number }) {
   const address = String(params.address || "").trim();
   const addCalories = Math.max(0, Math.floor(Number(params.addCalories || 0)));
@@ -184,7 +177,6 @@ export async function addActivity(params: { address: string; addCalories: number
 
   if (!address) throw new Error("missing address");
 
-  // Ensure user exists
   await upsertUser(address);
 
   const r = await pool.query(
@@ -232,6 +224,7 @@ export async function logSession(params: {
   bestSeconds: number;
   score: number;
   durationMs: number;
+  streak?: number; // ✅ NEW
 }) {
   const address = String(params.address || "").trim();
   const game = String(params.game || "unknown").trim().slice(0, 32);
@@ -241,6 +234,7 @@ export async function logSession(params: {
   const bestSeconds = Math.max(0, Number(params.bestSeconds || 0));
   const score = Math.max(0, Math.floor(Number(params.score || 0)));
   const durationMs = Math.max(0, Math.floor(Number(params.durationMs || 0)));
+  const streak = Math.max(0, Math.floor(Number(params.streak || 0))); // ✅ NEW
 
   if (!address) throw new Error("missing address");
 
@@ -248,11 +242,11 @@ export async function logSession(params: {
 
   const r = await pool.query(
     `
-    INSERT INTO sessions (address, game, calories, miles, best_seconds, score, duration_ms)
-    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    INSERT INTO sessions (address, game, calories, miles, best_seconds, score, duration_ms, streak)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
     RETURNING *;
     `,
-    [address, game, calories, miles, bestSeconds, score, durationMs]
+    [address, game, calories, miles, bestSeconds, score, durationMs, streak]
   );
 
   return r.rows[0] || null;
@@ -261,14 +255,15 @@ export async function logSession(params: {
 // -------------------------------
 // Leaderboard V2
 // window: lifetime | day | week | month
-// metric: calories | score | miles | duration
+// metric: calories | score | miles | duration | streak
 // optional game filter
 //
-// ✅ Change: basket score leaderboard uses MAX(score) (high score), not SUM(score)
+// ✅ Basket score uses MAX(score) (high score), not SUM(score)
+// ✅ Basket streak uses MAX(streak) (best streak), not SUM(streak)
 // -------------------------------
 export async function getLeaderboardV2(params: {
   window: "lifetime" | "day" | "week" | "month" | string;
-  metric: "calories" | "score" | "miles" | "duration" | string;
+  metric: "calories" | "score" | "miles" | "duration" | "streak" | string;
   game?: string;
   limit?: number;
 }) {
@@ -277,7 +272,6 @@ export async function getLeaderboardV2(params: {
   const game = params.game ? String(params.game).trim().slice(0, 32) : undefined;
   const limit = Math.max(1, Math.min(200, Number(params.limit || 30)));
 
-  // time filter
   let whereTime = "";
   if (window === "day") whereTime = `AND created_at >= date_trunc('day', NOW())`;
   if (window === "week") whereTime = `AND created_at >= date_trunc('week', NOW())`;
@@ -287,16 +281,16 @@ export async function getLeaderboardV2(params: {
   const args: any[] = [limit];
   if (game) args.push(game);
 
-  // metric selector
   let metricExpr = "SUM(calories)";
   if (metric === "score") {
-    // Basket = high score board
     metricExpr = game === "basket" ? "MAX(score)" : "SUM(score)";
+  }
+  if (metric === "streak") {
+    metricExpr = game === "basket" ? "MAX(streak)" : "MAX(streak)";
   }
   if (metric === "miles") metricExpr = "SUM(miles)";
   if (metric === "duration") metricExpr = "SUM(duration_ms)";
 
-  // lifetime shortcut uses users table for calories / miles
   if (window === "lifetime" && (metric === "calories" || metric === "miles")) {
     const col = metric === "miles" ? "total_miles" : "total_calories";
     const r = await pool.query(
@@ -317,7 +311,6 @@ export async function getLeaderboardV2(params: {
     return r.rows || [];
   }
 
-  // otherwise aggregate sessions + join users for display_name
   const r = await pool.query(
     `
     SELECT
@@ -328,7 +321,8 @@ export async function getLeaderboardV2(params: {
       SUM(s.miles)::DOUBLE PRECISION AS miles,
       SUM(s.score)::DOUBLE PRECISION AS score,
       SUM(s.duration_ms)::DOUBLE PRECISION AS duration_ms,
-      MAX(s.score)::DOUBLE PRECISION AS best_score
+      MAX(s.score)::DOUBLE PRECISION AS best_score,
+      MAX(s.streak)::DOUBLE PRECISION AS best_streak
     FROM sessions s
     LEFT JOIN users u ON u.address = s.address
     WHERE 1=1
@@ -345,7 +339,7 @@ export async function getLeaderboardV2(params: {
 }
 
 // -------------------------------
-// Activity summary (for /activity/summary)
+// Activity summary
 // -------------------------------
 export async function getActivitySummary(params: { address: string }) {
   const address = String(params.address || "").trim();
@@ -358,6 +352,7 @@ export async function getActivitySummary(params: { address: string }) {
     SELECT
       COALESCE(SUM(calories),0) AS calories,
       COALESCE(SUM(score),0) AS score,
+      COALESCE(MAX(streak),0) AS best_streak,
       COALESCE(SUM(miles),0) AS miles,
       COALESCE(SUM(duration_ms),0) AS duration_ms
     FROM sessions
@@ -372,6 +367,7 @@ export async function getActivitySummary(params: { address: string }) {
     SELECT
       COALESCE(SUM(calories),0) AS calories,
       COALESCE(SUM(score),0) AS score,
+      COALESCE(MAX(streak),0) AS best_streak,
       COALESCE(SUM(miles),0) AS miles,
       COALESCE(SUM(duration_ms),0) AS duration_ms
     FROM sessions
@@ -386,6 +382,7 @@ export async function getActivitySummary(params: { address: string }) {
     SELECT
       COALESCE(SUM(calories),0) AS calories,
       COALESCE(SUM(score),0) AS score,
+      COALESCE(MAX(streak),0) AS best_streak,
       COALESCE(SUM(miles),0) AS miles,
       COALESCE(SUM(duration_ms),0) AS duration_ms
     FROM sessions
@@ -401,6 +398,7 @@ export async function getActivitySummary(params: { address: string }) {
       game,
       COALESCE(SUM(calories),0) AS calories,
       COALESCE(SUM(score),0) AS score,
+      COALESCE(MAX(streak),0) AS best_streak,
       COALESCE(SUM(miles),0) AS miles,
       COALESCE(SUM(duration_ms),0) AS duration_ms
     FROM sessions
@@ -427,18 +425,21 @@ export async function getActivitySummary(params: { address: string }) {
     today: {
       calories: Number(day.rows[0]?.calories || 0),
       score: Number(day.rows[0]?.score || 0),
+      bestStreak: Number(day.rows[0]?.best_streak || 0),
       miles: Number(day.rows[0]?.miles || 0),
       durationMs: Number(day.rows[0]?.duration_ms || 0),
     },
     week: {
       calories: Number(week.rows[0]?.calories || 0),
       score: Number(week.rows[0]?.score || 0),
+      bestStreak: Number(week.rows[0]?.best_streak || 0),
       miles: Number(week.rows[0]?.miles || 0),
       durationMs: Number(week.rows[0]?.duration_ms || 0),
     },
     month: {
       calories: Number(month.rows[0]?.calories || 0),
       score: Number(month.rows[0]?.score || 0),
+      bestStreak: Number(month.rows[0]?.best_streak || 0),
       miles: Number(month.rows[0]?.miles || 0),
       durationMs: Number(month.rows[0]?.duration_ms || 0),
     },
@@ -446,6 +447,7 @@ export async function getActivitySummary(params: { address: string }) {
       game: r.game,
       calories: Number(r.calories || 0),
       score: Number(r.score || 0),
+      bestStreak: Number(r.best_streak || 0),
       miles: Number(r.miles || 0),
       durationMs: Number(r.duration_ms || 0),
     })),
