@@ -546,7 +546,11 @@ app.get("/leaderboard/v2", async (req: Request, res: Response) => {
   try {
     const window = normalizeWindow(req.query.window || "lifetime") as any;
     const metric = String(req.query.metric || "calories") as any;
-    const game = req.query.game ? String(req.query.game) : undefined;
+
+    // ✅ OPT 1: normalize game to avoid "Basket" / "BASKET" breaking MAX(score) logic in DB
+    const gameRaw = req.query.game ? String(req.query.game) : undefined;
+    const game = gameRaw ? asGameKey(gameRaw) : undefined;
+
     const limit = req.query.limit ? Number(req.query.limit) : 30;
 
     const rows = await getLeaderboardV2({ window, metric, game, limit });
