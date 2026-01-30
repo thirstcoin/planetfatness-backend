@@ -118,15 +118,16 @@ async function getTodayAgg(address: string, game: GameKey) {
   const r = await pool.query(
     `
     SELECT
-      COALESCE(SUM(calories),0) AS calories,
-      COALESCE(SUM(miles),0) AS miles,
-      COALESCE(SUM(duration_ms),0) AS duration_ms,
-      COALESCE(SUM(score),0) AS score,
-      COALESCE(MAX(score),0) AS best_score
+      -- Only sum these if they happened TODAY
+      COALESCE(SUM(CASE WHEN created_at >= date_trunc('day', NOW()) THEN calories ELSE 0 END), 0) AS calories,
+      COALESCE(SUM(CASE WHEN created_at >= date_trunc('day', NOW()) THEN miles ELSE 0 END), 0) AS miles,
+      COALESCE(SUM(CASE WHEN created_at >= date_trunc('day', NOW()) THEN duration_ms ELSE 0 END), 0) AS duration_ms,
+      COALESCE(SUM(CASE WHEN created_at >= date_trunc('day', NOW()) THEN score ELSE 0 END), 0) AS score,
+      
+      -- Look at your WHOLE history for the best score
+      COALESCE(MAX(score), 0) AS best_score
     FROM sessions
-    WHERE address=$1
-      AND game=$2
-      AND created_at >= date_trunc('day', NOW())
+    WHERE address=$1 AND game=$2
     `,
     [address, game]
   );
@@ -140,6 +141,7 @@ async function getTodayAgg(address: string, game: GameKey) {
     bestScore: Number(row.best_score || 0),
   };
 }
+
 
 function computeEarnedCalories(params: { game: GameKey; score: number; miles: number; bestSeconds: number; durationMs: number }) {
   const { game } = params;
