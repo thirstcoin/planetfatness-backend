@@ -594,25 +594,35 @@ app.get("/leaderboard/games", async (req: Request, res: Response) => {
 });
 
 /**
- * 🚀 ADMIN LAUNCH RESET
- * URL: https://your-site.render.com/admin/launch-reset?secret=launch2026
+ * 🚀 FIXED ADMIN LAUNCH RESET
+ * Clears EVERY stat shown on the Gym Card.
  */
 app.get("/admin/launch-reset", async (req: Request, res: Response) => {
   const secret = req.query.secret;
   if (secret !== "launch2026") return res.status(403).send("Unauthorized");
 
   try {
-    await pool.query(`UPDATE users SET total_calories = 0, total_miles = 0, best_seconds = 0;`);
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS lifetime_makes BIGINT NOT NULL DEFAULT 0;`);
-    await pool.query(`UPDATE users SET lifetime_makes = 0;`);
+    // 1. Reset ALL lifetime columns on the users table
+    await pool.query(`
+      UPDATE users 
+      SET total_calories = 0, 
+          total_miles = 0, 
+          best_seconds = 0, 
+          lifetime_makes = 0;
+    `);
+
+    // 2. Clear the sessions table (This wipes the Leaderboards & Daily/Weekly/Monthly)
     await pool.query(`TRUNCATE TABLE sessions CASCADE;`);
+
+    // 3. Reset the bot-specific table
     await pool.query(`UPDATE pf_users SET total_calories = 0;`);
 
-    res.type("text/plain").send("✅ Planet Fatness Reset Successfully! All users start at 0.");
+    res.type("text/plain").send("✅ Planet Fatness DEEP CLEANED! All stats, times, and miles are now 0.");
   } catch (err: any) {
     res.status(500).send("❌ Reset failed: " + err.message);
   }
 });
+
 
 // -------------------------------
 // Boot
