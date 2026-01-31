@@ -540,9 +540,9 @@ app.get("/leaderboard", async (_req: Request, res: Response) => {
 /**
  * GET /leaderboard/v2
  * query:
- *  window = lifetime | day | week | month  (also accepts daily|weekly|monthly)
- *  metric = calories | score | miles | duration | streak
- *  game   = runner | snack | lift | basket (optional)
+ * window = lifetime | day | week | month  (also accepts daily|weekly|monthly)
+ * metric = calories | score | miles | duration | streak
+ * game   = runner | snack | lift | basket (optional)
  */
 app.get("/leaderboard/v2", async (req: Request, res: Response) => {
   try {
@@ -590,6 +590,27 @@ app.get("/leaderboard/games", async (req: Request, res: Response) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Leaderboard games failed" });
+  }
+});
+
+/**
+ * 🚀 ADMIN LAUNCH RESET
+ * URL: https://your-site.render.com/admin/launch-reset?secret=launch2026
+ */
+app.get("/admin/launch-reset", async (req: Request, res: Response) => {
+  const secret = req.query.secret;
+  if (secret !== "launch2026") return res.status(403).send("Unauthorized");
+
+  try {
+    await pool.query(`UPDATE users SET total_calories = 0, total_miles = 0, best_seconds = 0;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS lifetime_makes BIGINT NOT NULL DEFAULT 0;`);
+    await pool.query(`UPDATE users SET lifetime_makes = 0;`);
+    await pool.query(`TRUNCATE TABLE sessions CASCADE;`);
+    await pool.query(`UPDATE pf_users SET total_calories = 0;`);
+
+    res.type("text/plain").send("✅ Planet Fatness Reset Successfully! All users start at 0.");
+  } catch (err: any) {
+    res.status(500).send("❌ Reset failed: " + err.message);
   }
 });
 
