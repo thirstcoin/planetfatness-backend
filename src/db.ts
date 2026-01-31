@@ -169,11 +169,18 @@ export async function setTelegramIdentity(params: {
   return r.rows[0] || null;
 }
 
-export async function addActivity(params: { address: string; addCalories: number; bestSeconds: number; addMiles: number }) {
+export async function addActivity(params: { 
+  address: string; 
+  addCalories: number; 
+  bestSeconds: number; 
+  addMiles: number; 
+  addScore?: number; // ✅ 1. Accept the new score points
+}) {
   const address = String(params.address || "").trim();
   const addCalories = Math.max(0, Math.floor(Number(params.addCalories || 0)));
   const addMiles = Math.max(0, Number(params.addMiles || 0));
   const bestSeconds = Math.max(0, Number(params.bestSeconds || 0));
+  const addScore = Math.max(0, Math.floor(Number(params.addScore || 0))); // ✅ 2. Clean the input
 
   if (!address) throw new Error("missing address");
 
@@ -186,11 +193,12 @@ export async function addActivity(params: { address: string; addCalories: number
       total_calories = total_calories + $2,
       total_miles = total_miles + $3,
       best_seconds = GREATEST(best_seconds, $4),
+      lifetime_makes = lifetime_makes + $5, -- ✅ 3. Add ONLY the new points to the total
       updated_at = NOW()
     WHERE address = $1
     RETURNING *;
     `,
-    [address, addCalories, addMiles, bestSeconds]
+    [address, addCalories, addMiles, bestSeconds, addScore] // ✅ 4. Pass the 5th variable
   );
 
   return r.rows[0] || null;
