@@ -6,6 +6,7 @@ dotenv.config();
 
 import type { Request, Response } from "express";
 import { Telegraf } from "telegraf"; // ✅ Added for Telegram Game support
+import jwt from "jsonwebtoken"; // ✅ Added: mint JWT for Telegram Game overlay without touching mini-app flow
 
 // --- Dynamic imports (so env is ready BEFORE db.ts reads DATABASE_URL) ---
 const expressMod = await import("express");
@@ -28,6 +29,8 @@ const {
   getLeaderboardV2,
   getActivitySummary,
   setDisplayName,
+  setTelegramIdentity, // ✅ Added: used by Telegram Game overlay
+  upsertUser,          // ✅ Added: used by Telegram Game overlay
   pool,
 } = dbMod;
 
@@ -78,6 +81,14 @@ function normalizeWindow(w: any): "lifetime" | "day" | "week" | "month" {
   if (s === "monthly") return "month";
   if (s === "day" || s === "week" || s === "month" || s === "lifetime") return s;
   return "lifetime";
+}
+
+// ✅ Mint the SAME kind of JWT as auth.ts does, but ONLY for Telegram Game overlay.
+// This does NOT change mini-app initData flow at all.
+function signTokenForAddress(address: string) {
+  const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
+  if (!JWT_SECRET) throw new Error("missing_jwt_secret");
+  return jwt.sign({ address }, JWT_SECRET, { expiresIn: "30d" });
 }
 
 // -------------------------------
@@ -142,7 +153,6 @@ async function getTodayAgg(address: string, game: GameKey) {
     bestScore: Number(row.best_score || 0),
   };
 }
-
 
 function computeEarnedCalories(params: { game: GameKey; score: number; miles: number; bestSeconds: number; durationMs: number }) {
   const { game } = params;
@@ -625,7 +635,7 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
 });
 
 // -------------------------------
-// ✅ TELEGRAM BOT ENGINE 
+// ✅ TELEGRAM BOT ENGINE
 // Added to handle Game Overlays and Group Banners
 // -------------------------------
 const bot = new Telegraf(process.env.TG_BOT_TOKEN || "");
@@ -636,16 +646,76 @@ bot.command("game", async (ctx) => {
   await ctx.replyWithGame("planetfatness");
 });
 
-// Handle the "Play" button clicks (The secret to the overlay)
+// Handle the "Play" button clicks (Game overlay auth without breaking mini-app flow)
 bot.on("callback_query", async (ctx) => {
-  if (ctx.callbackQuery && "game_short_name" in ctx.callbackQuery) {
-    const user = ctx.from;
-    // We pass the user details as query parameters so the frontend can detect them immediately
-    const userParam = encodeURIComponent(user.username || user.first_name);
-    const launchUrl = `https://planetfatness.fit/?id=${user.id}&user=${userParam}`;
-    
+  try {
+    if (!(ctx.callbackQuery && "game_short_name" in ctx.callbackQuery)) return;
+
+    const user: any = ctx.from;
+    const tgIdNum = Number(user?.id || 0);
+    const username = user?.username ? String(user.username) : "";
+    const firstName = user?.first_name ? String(user.first_name) : "";
+    const lastName = user?.last_name ? String(user.last_name) : "";
+
+    if (!tgIdNum) {
+      // Fallback: open site (guest)
+      await ctx.answerGameQuery("https://planetfatness.fit/");
+      return;
+    }
+
+    // Match your existing TG identity scheme from /auth/telegram
+    const address = `tg:${tgIdNum}`;
+
+    // ✅ Upsert + attach TG identity server-side
+    try {
+      await upsertUser(address);
+      await setTelegramIdentity({
+        address,
+        tgId: tgIdNum,
+        tgUsername: username || null,
+        firstName: firstName || null,
+        lastName: lastName || null,
+      });
+
+      const displayName =
+        (username ? `@${username}` : "") ||
+        ([firstName, lastName].filter(Boolean).join(" ").trim().slice(0, 24)) ||
+        "Member";
+
+      if (displayName && displayName.trim().length >= 2) {
+        try {
+          await setDisplayName({ address, displayName });
+        } catch {
+          // ignore
+        }
+      }
+    } catch (e) {
+      console.error("TG game upsert/identity failed:", e);
+      // still allow overlay to open as guest
+      await ctx.answerGameQuery("https://planetfatness.fit/");
+      return;
+    }
+
+    // ✅ Mint real JWT so requireAuth routes work in overlay
+    let token = "";
+    try {
+      token = signTokenForAddress(address);
+    } catch (e) {
+      console.error("TG game signToken failed:", e);
+      await ctx.answerGameQuery("https://planetfatness.fit/");
+      return;
+    }
+
+    // ✅ Send JWT to frontend via query param (frontend should store it)
+    const launchUrl = `https://planetfatness.fit/?t=${encodeURIComponent(token)}`;
+
     // Tells Telegram to open the URL as an overlay on top of the chat
     await ctx.answerGameQuery(launchUrl);
+  } catch (e) {
+    console.error("TG game callback handler error:", e);
+    try {
+      await ctx.answerGameQuery("https://planetfatness.fit/");
+    } catch {}
   }
 });
 
@@ -654,9 +724,10 @@ bot.on("callback_query", async (ctx) => {
 // -------------------------------
 try {
   await initDb();
+
   // Launch Bot Engine
   bot.launch().then(() => console.log("🤖 Planet Fatness Bot Engine Active"));
-  
+
   app.listen(PORT, () => console.log(`✅ Planet Fatness backend on :${PORT}`));
 } catch (e) {
   console.error("❌ Failed to boot:", e);
