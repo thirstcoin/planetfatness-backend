@@ -625,10 +625,10 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
 });
 
 // -------------------------------
-// ✅ TELEGRAM BOT ENGINE (WHALLY STYLE)
+// ✅ TELEGRAM BOT ENGINE 
 // Added to handle Game Overlays and Group Banners
 // -------------------------------
-const bot = new Telegraf(process.env.BOT_TOKEN || "");
+const bot = new Telegraf(process.env.TG_BOT_TOKEN || "");
 
 // Listen for the /games command to send the official Game Banner
 bot.command("games", async (ctx) => {
