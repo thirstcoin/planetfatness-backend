@@ -630,17 +630,22 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
 // -------------------------------
 const bot = new Telegraf(process.env.TG_BOT_TOKEN || "");
 
-// Listen for the /games command to send the official Game Banner
-bot.command("games", async (ctx) => {
+// Listen for the /game command to send the official Game Banner
+bot.command("game", async (ctx) => {
   // 'planetfatness' must match your BotFather Game Short Name exactly
   await ctx.replyWithGame("planetfatness");
 });
 
 // Handle the "Play" button clicks (The secret to the overlay)
 bot.on("callback_query", async (ctx) => {
-  if ("game_short_name" in ctx.callbackQuery) {
+  if (ctx.callbackQuery && "game_short_name" in ctx.callbackQuery) {
+    const user = ctx.from;
+    // We pass the user details as query parameters so the frontend can detect them immediately
+    const userParam = encodeURIComponent(user.username || user.first_name);
+    const launchUrl = `https://planetfatness.fit/?id=${user.id}&user=${userParam}`;
+    
     // Tells Telegram to open the URL as an overlay on top of the chat
-    await ctx.answerGameQuery("https://planetfatness.fit/");
+    await ctx.answerGameQuery(launchUrl);
   }
 });
 
