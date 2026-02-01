@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import type { Request, Response } from "express";
+import { Telegraf } from "telegraf"; // ✅ Added for Telegram Game support
 
 // --- Dynamic imports (so env is ready BEFORE db.ts reads DATABASE_URL) ---
 const expressMod = await import("express");
@@ -623,12 +624,34 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
   }
 });
 
+// -------------------------------
+// ✅ TELEGRAM BOT ENGINE (WHALLY STYLE)
+// Added to handle Game Overlays and Group Banners
+// -------------------------------
+const bot = new Telegraf(process.env.BOT_TOKEN || "");
+
+// Listen for the /games command to send the official Game Banner
+bot.command("games", async (ctx) => {
+  // 'planetfatness' must match your BotFather Game Short Name exactly
+  await ctx.replyWithGame("planetfatness");
+});
+
+// Handle the "Play" button clicks (The secret to the overlay)
+bot.on("callback_query", async (ctx) => {
+  if ("game_short_name" in ctx.callbackQuery) {
+    // Tells Telegram to open the URL as an overlay on top of the chat
+    await ctx.answerGameQuery("https://planetfatness.fit/");
+  }
+});
 
 // -------------------------------
 // Boot
 // -------------------------------
 try {
   await initDb();
+  // Launch Bot Engine
+  bot.launch().then(() => console.log("🤖 Planet Fatness Bot Engine Active"));
+  
   app.listen(PORT, () => console.log(`✅ Planet Fatness backend on :${PORT}`));
 } catch (e) {
   console.error("❌ Failed to boot:", e);
