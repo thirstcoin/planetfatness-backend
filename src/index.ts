@@ -769,7 +769,8 @@ bot.command("game", async (ctx) => {
 // Handle the "Play" button clicks
 bot.on("callback_query", async (ctx) => {
   try {
-    if (!(ctx.callbackQuery && "game_short_name" in ctx.callbackQuery)) return;
+    const q = ctx.callbackQuery;
+    if (!q || !("game_short_name" in q)) return;
 
     const user: any = ctx.from;
     const tgIdNum = Number(user?.id || 0);
@@ -823,8 +824,13 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
 
-    // ✅ Send JWT to frontend via query param (frontend should store it)
-    const launchUrl = `https://planetfatness.fit/?t=${encodeURIComponent(token)}`;
+    // ✅ Generate Launch URL based on which game was clicked
+    let launchUrl = `https://planetfatness.fit/?t=${encodeURIComponent(token)}`;
+    
+    // Check if the user specifically clicked the 'Greed' game card
+    if (q.game_short_name === 'Greed') {
+       launchUrl = `https://planetfatness.fit/greed?t=${encodeURIComponent(token)}`;
+    }
 
     // Tells Telegram to open the URL as an overlay on top of the chat
     await ctx.answerGameQuery(launchUrl);
