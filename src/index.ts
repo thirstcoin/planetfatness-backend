@@ -755,7 +755,7 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
 });
 
 // -------------------------------
-// ✅ TELEGRAM BOT ENGINE
+// ✅ TELEGRAM BOT ENGINE (GREED)
 // Conflict-Proof: Uses GREED_BOT_TOKEN
 // -------------------------------
 const bot = new Telegraf(process.env.GREED_BOT_TOKEN || "");
@@ -842,17 +842,46 @@ bot.on("callback_query", async (ctx) => {
   }
 });
 
+// -----------------------------------------------------------
+// ✅ GYM BOT ENGINE (PLANET FATNESS)
+// Uses TG_BOT_TOKEN to keep your original bot alive.
+// -----------------------------------------------------------
+const gymBot = new Telegraf(process.env.TG_BOT_TOKEN || "");
+
+gymBot.start((ctx) => {
+  ctx.reply("🏋️ Welcome back to Planet Fatness Gym! Use the button below to start your workout.");
+});
+
+// Generic game handler for the Gym Bot so it can still launch the app
+gymBot.on("callback_query", async (ctx) => {
+    try {
+        const address = `tg:${ctx.from.id}`;
+        const token = signTokenForAddress(address);
+        await ctx.answerGameQuery(`https://planetfatness.fit/?t=${encodeURIComponent(token)}`);
+    } catch (e) {
+        await ctx.answerGameQuery("https://planetfatness.fit/");
+    }
+});
+
+
 // -------------------------------
 // Boot
 // -------------------------------
 try {
   await initDb();
 
-  // Launch Bot Engine with Conflict Shield
+  // Launch Greed Bot Engine
   if (process.env.GREED_BOT_TOKEN) {
     bot.launch().then(() => console.log("🤖 Planet Fatness Greed Bot Engine Active"));
   } else {
     console.warn("⚠️ No GREED_BOT_TOKEN found in environment.");
+  }
+
+  // Launch Gym Bot Engine
+  if (process.env.TG_BOT_TOKEN) {
+    gymBot.launch().then(() => console.log("🤖 Planet Fatness Gym Bot Engine Active"));
+  } else {
+    console.warn("⚠️ No TG_BOT_TOKEN found in environment.");
   }
 
   app.listen(PORT, () => console.log(`✅ Planet Fatness backend on :${PORT}`));
