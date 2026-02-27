@@ -15,8 +15,6 @@ if (!JWT_SECRET) {
 
 /**
  * ✅ Telegram Bot Token (from BotFather)
- * Common bad_hash cause: accidental quotes / spaces / newline in env.
- * We hard-clean here. (We do NOT print the token.)
  */
 const TG_BOT_TOKEN = String(process.env.TG_BOT_TOKEN || "")
   .trim()
@@ -25,17 +23,12 @@ const TG_BOT_TOKEN = String(process.env.TG_BOT_TOKEN || "")
 
 if (!TG_BOT_TOKEN) {
   console.warn("⚠️ Missing TG_BOT_TOKEN. /auth/telegram will fail until you set it.");
-} else {
-  const hasNewline = TG_BOT_TOKEN.includes("\n") || TG_BOT_TOKEN.includes("\r");
-  const hasSpace = TG_BOT_TOKEN.includes(" ");
-  const botId = TG_BOT_TOKEN.split(":")[0] || "unknown";
-  console.log("[TG] TG_BOT_TOKEN botId:", botId, "len:", TG_BOT_TOKEN.length, "newline:", hasNewline, "space:", hasSpace);
 }
 
 // Optional: how old initData can be (seconds). Default 1 day.
 const TG_MAX_AGE_SEC = Number(process.env.TG_MAX_AGE_SEC || 86400);
 
-// Optional debug logs (set TG_DEBUG=1 in Render)
+// Optional debug logs
 const TG_DEBUG = String(process.env.TG_DEBUG || "").trim() === "1";
 
 type Challenge = { nonce: string; message: string; exp: number };
@@ -73,6 +66,9 @@ function decodeSignature(sig: string): Uint8Array {
   return bs58.decode(s);
 }
 
+/**
+ * ✅ Middleware for protected routes (like Greed and Activity)
+ */
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
   const h = req.headers.authorization || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : "";
@@ -115,7 +111,7 @@ router.get("/me", requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * POST /auth/challenge
+ * POST /auth/challenge (Solana/Wallet Auth)
  */
 router.post("/challenge", async (req: Request, res: Response) => {
   const address = safeStr(req.body?.address);
@@ -140,7 +136,7 @@ router.post("/challenge", async (req: Request, res: Response) => {
 });
 
 /**
- * POST /auth/verify
+ * POST /auth/verify (Solana/Wallet Auth)
  */
 router.post("/verify", async (req: Request, res: Response) => {
   if (!JWT_SECRET) return res.status(500).json({ error: "Server missing JWT_SECRET" });
@@ -182,20 +178,13 @@ router.post("/verify", async (req: Request, res: Response) => {
 
 /* =========================================================
    TELEGRAM WEB APP AUTH
-   POST /auth/telegram
-   body: { initData }  // Telegram.WebApp.initData (raw querystring)
    ========================================================= */
 
 function parseInitData(initData: string): Record<string, string> {
   const out: Record<string, string> = {};
   let s = String(initData ?? "");
   if (!s) return out;
-
-  // Sometimes callers accidentally pass "?a=b&c=d"
   if (s.startsWith("?")) s = s.slice(1);
-
-  // IMPORTANT: do NOT "decode then re-encode" initData.
-  // URLSearchParams gives us decoded key/value pairs (as Telegram expects for data_check_string).
   const usp = new URLSearchParams(s);
   usp.forEach((v, k) => (out[k] = v));
   return out;
@@ -207,12 +196,10 @@ function buildDataCheckString(data: Record<string, string>) {
   return { keys, dataCheckString };
 }
 
-// ✅ Correct Telegram WebApp secret derivation
 function secretKey_WebAppData(botToken: string) {
   return crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
 }
 
-// (Fallback) Older/other flows sometimes use sha256(botToken)
 function secretKey_Sha256Token(botToken: string) {
   return crypto.createHash("sha256").update(botToken).digest();
 }
@@ -231,38 +218,24 @@ function verifyTelegramInitData(
 
   const { keys, dataCheckString } = buildDataCheckString(data);
 
-  // ✅ Try correct WebApp method first
   const computedWebApp = hmacHex(secretKey_WebAppData(botToken), dataCheckString);
-
-  // Fallback method (helps diagnose if someone mixed docs/flows)
   const computedSha = hmacHex(secretKey_Sha256Token(botToken), dataCheckString);
 
   const okWebApp = computedWebApp === providedHash;
   const okSha = computedSha === providedHash;
 
   if (TG_DEBUG) {
-    console.log("[TG_VERIFY] initLen:", String(initData ?? "").length);
-    console.log("[TG_VERIFY] keys:", keys.join(","));
     console.log("[TG_VERIFY] dataCheckString:\n" + dataCheckString);
-    console.log("[TG_VERIFY] providedHash:", providedHash);
-    console.log("[TG_VERIFY] computed(WebAppData):", computedWebApp);
-    console.log("[TG_VERIFY] computed(sha256token):", computedSha);
     console.log("[TG_VERIFY] match webapp?", okWebApp, "match sha?", okSha);
   }
 
   if (!okWebApp && !okSha) {
-    // Keep toast readable: include short hashes + keycount
     return {
       ok: false,
-      error:
-        `bad_hash|provided=${String(providedHash).slice(0, 12)}` +
-        `|webapp=${String(computedWebApp).slice(0, 12)}` +
-        `|sha=${String(computedSha).slice(0, 12)}` +
-        `|keys=${keys.length}|initLen=${String(initData ?? "").length}`,
+      error: `bad_hash|keys=${keys.length}|initLen=${String(initData ?? "").length}`,
     };
   }
 
-  // ✅ If one matches, continue
   const authDate = Number(data.auth_date || 0);
   if (!authDate) return { ok: false, error: "missing_auth_date" };
 
@@ -285,7 +258,6 @@ router.post("/telegram", async (req: Request, res: Response) => {
     if (!JWT_SECRET) return res.status(500).json({ error: "Server missing JWT_SECRET" });
     if (!TG_BOT_TOKEN) return res.status(500).json({ error: "Server missing TG_BOT_TOKEN" });
 
-    // IMPORTANT: do not trim initData; send/verify raw
     const initData = String(req.body?.initData ?? "");
     if (!initData) return res.status(400).json({ error: "Missing initData" });
 
@@ -293,7 +265,6 @@ router.post("/telegram", async (req: Request, res: Response) => {
     if (!v.ok) return res.status(401).json({ error: `tg_${v.error}` });
 
     const tgUser = v.data.user as any;
-
     const tgIdNum = Number(tgUser.id);
     const username = tgUser.username ? String(tgUser.username) : "";
     const firstName = tgUser.first_name ? String(tgUser.first_name) : "";
@@ -316,11 +287,7 @@ router.post("/telegram", async (req: Request, res: Response) => {
       "Member";
 
     if (displayName && displayName.trim().length >= 2) {
-      try {
-        await setDisplayName({ address, displayName });
-      } catch {
-        // ignore
-      }
+      try { await setDisplayName({ address, displayName }); } catch { }
     }
 
     const token = signToken(address);
@@ -333,17 +300,8 @@ router.post("/telegram", async (req: Request, res: Response) => {
       profile: {
         displayName: me?.display_name || displayName || null,
         tgId: me?.tg_id ?? tgIdNum,
-        tgUsername: me?.tg_username ?? (username || null),
-        tgFirstName: me?.tg_first_name ?? (firstName || null),
-        tgLastName: me?.tg_last_name ?? (lastName || null),
       },
-      telegram: {
-        id: tgUser.id,
-        username: username || null,
-        first_name: firstName || null,
-        last_name: lastName || null,
-        language_code: tgUser.language_code || null,
-      },
+      telegram: tgUser
     });
   } catch (e) {
     console.error("telegram auth error:", e);
