@@ -241,6 +241,19 @@ function computeDailyGoalProgress(params: { game: GameKey; today: { score: numbe
 }
 
 // -------------------------------
+// 🍩 FEED YOUR GREED CONFIG
+// -------------------------------
+const GREED_TAX = 0.03; // 3% fee
+const CHAOS_UNLOCK_THRESHOLD = 500000; // 500k PHAT required to play Chaos
+
+// Ladder maps safe clicks -> multiplier. 
+// Index 0 is a placeholder so index 1 = 1st safe donut.
+const MULTIPLIERS: Record<string, number[]> = {
+  classic: [0, 1.02, 1.06, 1.14, 1.30, 1.45, 1.70, 2.05, 2.35, 2.60, 2.85, 3.00],
+  chaos:   [0, 1.10, 1.25, 1.45, 1.80, 2.25, 2.75, 3.10, 3.28, 3.40, 3.50]
+};
+
+// -------------------------------
 // Routes
 // -------------------------------
 app.get("/", (_req: Request, res: Response) => {
@@ -407,7 +420,7 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
   const v2BestSeconds = req.body?.bestSeconds != null ? Number(req.body.bestSeconds) : undefined;
   const v2Score = req.body?.score != null ? Number(req.body.score) : undefined;
   const v2DurationMs = req.body?.durationMs != null ? Number(req.body.durationMs) : undefined;
-  const v2Streak = req.body?.streak != null ? Number(req.body.streak) : undefined; // ✅ NEW (optional)
+  const v2Streak = req.body?.streak != null ? Number(req.body.streak) : undefined; 
 
   // Aliases (v2 wins if present)
   const finalAddCalories = Number.isFinite(v2Calories as any) ? Number(v2Calories) : legacyAddCalories;
@@ -444,7 +457,7 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
         miles: Math.max(0, Number(finalAddMiles || 0)),
         bestSeconds: Math.max(0, Number(finalBestSeconds || 0)),
         score: Math.max(0, Number(finalScore || 0)),
-        streak: finalStreak, // ✅ NEW
+        streak: finalStreak, 
         durationMs: Math.max(0, Math.floor(finalDurationMs || 0)),
       });
     } catch (e) {
@@ -475,7 +488,7 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
     const bestSeconds = Number(req.body?.bestSeconds ?? 0);
     const durationMs = Number(req.body?.durationMs ?? 0);
 
-    // ✅ NEW: optional streak (used by basket “one miss ends run”)
+    // ✅ optional streak
     const streak = Math.max(0, Math.floor(Number(req.body?.streak ?? 0) || 0));
 
     if (!Number.isFinite(durationMs) || durationMs <= 0) {
@@ -498,7 +511,7 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
     const remaining = Math.max(0, rules.dailyCapCalories - todayBefore.calories);
     const earnedCapped = Math.max(0, Math.min(calc.earnedCalories, remaining));
 
-    // 3) log receipt (✅ includes streak)
+    // 3) log receipt 
     await logSession({
       address,
       game,
@@ -506,7 +519,7 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
       miles: Math.max(0, miles || 0),
       bestSeconds: Math.max(0, bestSeconds || 0),
       score: Math.max(0, score || 0),
-      streak, // ✅ NEW
+      streak, 
       durationMs: Math.max(0, Math.floor(durationMs || 0)),
     });
 
@@ -555,17 +568,26 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
 });
 
 // -------------------------------
-// 🍩 FEED YOUR GREED API
+// 🍩 FEED YOUR GREED API (REFINED)
 // -------------------------------
 
 /**
  * POST /greed/start
- * Starts a new round. Generates the "poison" locations server-side.
+ * Starts a new round. Generates the "poison" locations server-side based on 12 donuts.
  */
 app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
-    const { wager, netStake, mode } = req.body;
+    const { wager, mode } = req.body;
+
+    // 1. Chaos Mode Balance Check (Unlocked at 500k PHAT)
+    if (mode === "chaos") {
+      const me = await getMe(address);
+      const balance = Number(me?.total_calories || 0); 
+      if (balance < CHAOS_UNLOCK_THRESHOLD) {
+        return res.status(403).json({ error: "Chaos Mode requires 500,000 PHAT" });
+      }
+    }
 
     // Check if already in a round
     const existing = await getActiveGreedRound(address);
@@ -573,12 +595,15 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Round already active", round: existing });
     }
 
-    // Logic: 24 total slots. 
-    // Classic = 1 poison. Chaos = 3 poisons.
-    const poisonCount = mode === "chaos" ? 3 : 1;
+    // 2. Apply 3% Game Tax to generate Net Stake
+    const netStake = Number(wager) * (1 - GREED_TAX);
+
+    // 3. Logic: 12 total slots. 
+    // Classic = 1 poison. Chaos = 2 poisons.
+    const poisonCount = mode === "chaos" ? 2 : 1;
     const poisonIndices: number[] = [];
     while (poisonIndices.length < poisonCount) {
-      const r = Math.floor(Math.random() * 24);
+      const r = Math.floor(Math.random() * 12);
       if (!poisonIndices.includes(r)) {
         poisonIndices.push(r);
       }
@@ -589,13 +614,13 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
     const round = await createGreedRound({
       address,
       wager: Number(wager),
-      netStake: Number(netStake),
+      netStake,
       mode,
       poisonIndices,
       seed
     });
 
-    res.json({ ok: true, roundId: round.id, mode: round.mode });
+    res.json({ ok: true, roundId: round.id, mode: round.mode, netStake });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to start greed round" });
@@ -618,26 +643,41 @@ app.post("/greed/step", requireAuth, async (req: Request, res: Response) => {
 
 /**
  * POST /greed/finish
- * Ends the game. Finalizes payout.
+ * Ends the game. Finalizes payout based on spec multipliers.
  */
 app.post("/greed/finish", requireAuth, async (req: Request, res: Response) => {
   try {
-    const { roundId, status, payout } = req.body;
-    const round = await finishGreedRound(Number(roundId), status, Number(payout));
+    const { roundId, status } = req.body;
+    const address = (req as any).user?.address as string;
+    
+    const activeRound = await getActiveGreedRound(address);
+    if (!activeRound || activeRound.id !== Number(roundId)) {
+      return res.status(404).json({ error: "No active round found" });
+    }
+
+    // Server-side Payout Calculation based on Spec Ladders
+    let finalPayout = 0;
+    if (status === 'won') {
+      const ladder = MULTIPLIERS[activeRound.mode];
+      // safe_clicks determines which index to use from the spec ladder
+      const mult = ladder[activeRound.safe_clicks] || 0;
+      finalPayout = Math.floor(activeRound.net_stake * mult);
+    }
+
+    const round = await finishGreedRound(Number(roundId), status, finalPayout);
     
     // Log it as a session so it shows on leaderboards
-    const address = (req as any).user?.address as string;
     await logSession({
       address,
       game: "greed",
       calories: 0, 
       miles: 0,
       bestSeconds: 0,
-      score: status === 'won' ? Number(payout) : 0,
+      score: status === 'won' ? finalPayout : 0,
       durationMs: 0
     });
 
-    res.json({ ok: true, status: round.status, payout: round.payout });
+    res.json({ ok: true, status: round.status, payout: finalPayout });
   } catch (e) {
     res.status(500).json({ error: "Greed finish failed" });
   }
@@ -653,6 +693,7 @@ app.get("/greed/active", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
+// -------------------------------
 /**
  * GET /leaderboard (legacy, lifetime users table)
  */
