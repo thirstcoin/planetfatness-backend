@@ -1,4 +1,3 @@
-// src/db.ts
 import pg from "pg";
 
 const { Pool } = pg;
@@ -77,7 +76,31 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_address_created ON sessions(address, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_game_created ON sessions(game, created_at DESC);`);
 
-  console.log("✅ DB ready (Preserved TG + Added Basketball Tracking)");
+  // 🍩 FEED YOUR GREED TABLE (New logic)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS greed_rounds (
+      id BIGSERIAL PRIMARY KEY,
+      address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
+      wager BIGINT NOT NULL,
+      net_stake BIGINT NOT NULL,
+      mode TEXT NOT NULL,
+      poison_indices INTEGER[] NOT NULL,
+      server_seed TEXT NOT NULL,
+      status TEXT DEFAULT 'active',
+      safe_clicks INT DEFAULT 0,
+      payout BIGINT DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE greed_rounds 
+    ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_address ON greed_rounds(address);`);
+
+  console.log("✅ DB ready (Preserved TG + Added Basketball + Greed Game)");
 }
 
 // -------------------------------
@@ -440,7 +463,7 @@ export async function getActivitySummary(params: { address: string }) {
       totalCalories: Number(me?.total_calories || 0),
       totalMiles: Number(me?.total_miles || 0),
       bestSeconds: Number(me?.best_seconds || 0),
-      lifetimeMakes: Number(me?.lifetime_makes || 0), // Added here
+      lifetimeMakes: Number(me?.lifetime_makes || 0),
     },
     today: {
       calories: Number(d.calories || 0),
@@ -476,4 +499,52 @@ export async function getActivitySummary(params: { address: string }) {
       durationMs: Number(r.duration_ms || 0),
     })),
   };
+}
+
+// -------------------------------
+// 🍩 FEED YOUR GREED LOGIC
+// -------------------------------
+
+export async function createGreedRound(params: {
+  address: string;
+  wager: number;
+  netStake: number;
+  mode: string;
+  poisonIndices: number[];
+  seed: string;
+}) {
+  await upsertUser(params.address);
+  const r = await pool.query(
+    `INSERT INTO greed_rounds (address, wager, net_stake, mode, poison_indices, server_seed)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING *;`,
+    [params.address, params.wager, params.netStake, params.mode, params.poisonIndices, params.seed]
+  );
+  return r.rows[0];
+}
+
+export async function updateGreedStep(id: number, safeClicks: number) {
+  const r = await pool.query(
+    `UPDATE greed_rounds SET safe_clicks = $2 WHERE id = $1 RETURNING *;`,
+    [id, safeClicks]
+  );
+  return r.rows[0];
+}
+
+export async function finishGreedRound(id: number, status: 'won' | 'lost', payout: number) {
+  const r = await pool.query(
+    `UPDATE greed_rounds 
+     SET status = $2, payout = $3, is_active = false 
+     WHERE id = $1 RETURNING *;`,
+    [id, status, Math.floor(payout)]
+  );
+  return r.rows[0];
+}
+
+export async function getActiveGreedRound(address: string) {
+  const r = await pool.query(
+    `SELECT * FROM greed_rounds WHERE address = $1 AND status = 'active' LIMIT 1;`,
+    [address]
+  );
+  return r.rows[0] || null;
 }
