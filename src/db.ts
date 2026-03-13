@@ -34,7 +34,7 @@ export async function initDb() {
     ADD COLUMN IF NOT EXISTS display_name TEXT;
   `);
 
-  // ✅ Telegram identity columns (Preserved)
+  // Telegram identity columns
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS tg_id BIGINT,
@@ -46,7 +46,7 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_username ON users(tg_username);`);
 
-  // ✅ Basketball Lifetime Column (Safely Added)
+  // Basketball lifetime
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS lifetime_makes BIGINT NOT NULL DEFAULT 0;
@@ -67,7 +67,6 @@ export async function initDb() {
     );
   `);
 
-  // ✅ Streak column for games like basket
   await pool.query(`
     ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS streak INT NOT NULL DEFAULT 0;
@@ -76,31 +75,60 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_address_created ON sessions(address, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_game_created ON sessions(game, created_at DESC);`);
 
-  // 🍩 FEED YOUR GREED TABLE (New logic)
+  // 🍩 FEED YOUR GREED ROUNDS
   await pool.query(`
     CREATE TABLE IF NOT EXISTS greed_rounds (
       id BIGSERIAL PRIMARY KEY,
       address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
       wager BIGINT NOT NULL,
       net_stake BIGINT NOT NULL,
-      mode TEXT NOT NULL,
       poison_indices INTEGER[] NOT NULL,
       server_seed TEXT NOT NULL,
-      status TEXT DEFAULT 'active',
-      safe_clicks INT DEFAULT 0,
-      payout BIGINT DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      status TEXT NOT NULL DEFAULT 'active',
+      result TEXT,
+      safe_clicks INT NOT NULL DEFAULT 0,
+      current_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+      payout BIGINT NOT NULL DEFAULT 0,
+      payout_status TEXT NOT NULL DEFAULT 'unpaid',
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ended_at TIMESTAMPTZ
     );
   `);
 
   await pool.query(`
-    ALTER TABLE greed_rounds 
-    ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
+    ALTER TABLE greed_rounds
+    ADD COLUMN IF NOT EXISTS result TEXT,
+    ADD COLUMN IF NOT EXISTS current_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    ADD COLUMN IF NOT EXISTS payout_status TEXT NOT NULL DEFAULT 'unpaid',
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
+  `);
+
+  await pool.query(`
+    ALTER TABLE greed_rounds
+    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_address ON greed_rounds(address);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_status_created ON greed_rounds(status, created_at DESC);`);
 
-  console.log("✅ DB ready (Preserved TG + Added Basketball + Greed Game)");
+  // 🍩 FEED YOUR GREED PICKS (audit trail / anti-replay)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS greed_picks (
+      id BIGSERIAL PRIMARY KEY,
+      round_id BIGINT NOT NULL REFERENCES greed_rounds(id) ON DELETE CASCADE,
+      donut_index INT NOT NULL,
+      result TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(round_id, donut_index)
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_picks_round ON greed_picks(round_id, created_at ASC);`);
+
+  console.log("✅ DB ready (TG + games + hardened Greed)");
 }
 
 // -------------------------------
@@ -198,12 +226,12 @@ export async function setTelegramIdentity(params: {
   return r.rows[0] || null;
 }
 
-export async function addActivity(params: { 
-  address: string; 
-  addCalories: number; 
-  bestSeconds: number; 
-  addMiles: number; 
-  addScore?: number; 
+export async function addActivity(params: {
+  address: string;
+  addCalories: number;
+  bestSeconds: number;
+  addMiles: number;
+  addScore?: number;
 }) {
   const address = String(params.address || "").trim();
   const addCalories = Math.max(0, Math.floor(Number(params.addCalories || 0)));
@@ -290,7 +318,7 @@ export async function logSession(params: {
 }
 
 // -------------------------------
-// Leaderboard V2
+// Leaderboard V2 (existing games)
 // -------------------------------
 export async function getLeaderboardV2(params: {
   window: "lifetime" | "day" | "week" | "month" | string;
@@ -341,7 +369,6 @@ export async function getLeaderboardV2(params: {
   if (metric === "duration") metricExpr = "SUM(s.duration_ms)";
 
   const scoreField = isBasket ? "MAX(s.score)" : "SUM(s.score)";
-  const streakField = "MAX(s.streak)";
   const shotsMadeField = "SUM(s.score)";
 
   const r = await pool.query(
@@ -504,47 +531,301 @@ export async function getActivitySummary(params: { address: string }) {
 // -------------------------------
 // 🍩 FEED YOUR GREED LOGIC
 // -------------------------------
-
 export async function createGreedRound(params: {
   address: string;
   wager: number;
   netStake: number;
-  mode: string;
   poisonIndices: number[];
   seed: string;
 }) {
   await upsertUser(params.address);
-  const r = await pool.query(
-    `INSERT INTO greed_rounds (address, wager, net_stake, mode, poison_indices, server_seed)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING *;`,
-    [params.address, params.wager, params.netStake, params.mode, params.poisonIndices, params.seed]
-  );
-  return r.rows[0];
-}
 
-export async function updateGreedStep(id: number, safeClicks: number) {
   const r = await pool.query(
-    `UPDATE greed_rounds SET safe_clicks = $2 WHERE id = $1 RETURNING *;`,
-    [id, safeClicks]
+    `
+    INSERT INTO greed_rounds (
+      address,
+      wager,
+      net_stake,
+      poison_indices,
+      server_seed,
+      status,
+      result,
+      safe_clicks,
+      current_multiplier,
+      payout,
+      payout_status,
+      is_active,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5, 'active', NULL, 0, 1.0, 0, 'unpaid', TRUE, NOW(), NOW())
+    RETURNING *;
+    `,
+    [params.address, Math.floor(params.wager), Math.floor(params.netStake), params.poisonIndices, params.seed]
   );
-  return r.rows[0];
-}
 
-export async function finishGreedRound(id: number, status: 'won' | 'lost', payout: number) {
-  const r = await pool.query(
-    `UPDATE greed_rounds 
-     SET status = $2, payout = $3, is_active = false 
-     WHERE id = $1 RETURNING *;`,
-    [id, status, Math.floor(payout)]
-  );
-  return r.rows[0];
+  return r.rows[0] || null;
 }
 
 export async function getActiveGreedRound(address: string) {
   const r = await pool.query(
-    `SELECT * FROM greed_rounds WHERE address = $1 AND status = 'active' LIMIT 1;`,
+    `
+    SELECT *
+    FROM greed_rounds
+    WHERE address = $1 AND status = 'active' AND is_active = TRUE
+    ORDER BY created_at DESC
+    LIMIT 1;
+    `,
     [address]
   );
   return r.rows[0] || null;
+}
+
+export async function getGreedRoundByIdForAddress(roundId: number, address: string) {
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM greed_rounds
+    WHERE id = $1 AND address = $2
+    LIMIT 1;
+    `,
+    [roundId, address]
+  );
+  return r.rows[0] || null;
+}
+
+export async function getGreedPickedIndices(roundId: number): Promise<number[]> {
+  const r = await pool.query(
+    `
+    SELECT donut_index
+    FROM greed_picks
+    WHERE round_id = $1
+    ORDER BY created_at ASC;
+    `,
+    [roundId]
+  );
+
+  return (r.rows || []).map((x: any) => Number(x.donut_index));
+}
+
+export async function recordGreedPick(params: {
+  roundId: number;
+  donutIndex: number;
+  result: "safe" | "poison";
+}) {
+  const r = await pool.query(
+    `
+    INSERT INTO greed_picks (round_id, donut_index, result)
+    VALUES ($1, $2, $3)
+    RETURNING *;
+    `,
+    [params.roundId, params.donutIndex, params.result]
+  );
+  return r.rows[0] || null;
+}
+
+export async function updateGreedRoundState(params: {
+  roundId: number;
+  safeClicks: number;
+  currentMultiplier: number;
+  status?: string;
+  result?: string | null;
+  payout?: number;
+  payoutStatus?: string;
+  isActive?: boolean;
+  endedAt?: boolean;
+}) {
+  const r = await pool.query(
+    `
+    UPDATE greed_rounds
+    SET
+      safe_clicks = $2,
+      current_multiplier = $3,
+      status = COALESCE($4, status),
+      result = COALESCE($5, result),
+      payout = COALESCE($6, payout),
+      payout_status = COALESCE($7, payout_status),
+      is_active = COALESCE($8, is_active),
+      updated_at = NOW(),
+      ended_at = CASE WHEN $9 THEN NOW() ELSE ended_at END
+    WHERE id = $1
+    RETURNING *;
+    `,
+    [
+      params.roundId,
+      params.safeClicks,
+      params.currentMultiplier,
+      params.status ?? null,
+      params.result ?? null,
+      params.payout != null ? Math.floor(params.payout) : null,
+      params.payoutStatus ?? null,
+      params.isActive != null ? params.isActive : null,
+      params.endedAt === true,
+    ]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function closeGreedRoundAsPoison(params: {
+  roundId: number;
+  safeClicks: number;
+  currentMultiplier: number;
+}) {
+  return updateGreedRoundState({
+    roundId: params.roundId,
+    safeClicks: params.safeClicks,
+    currentMultiplier: params.currentMultiplier,
+    status: "closed",
+    result: "poison",
+    payout: 0,
+    payoutStatus: "unpaid",
+    isActive: false,
+    endedAt: true,
+  });
+}
+
+export async function closeGreedRoundAsCashout(params: {
+  roundId: number;
+  safeClicks: number;
+  currentMultiplier: number;
+  payout: number;
+  result: "cashout" | "perfect";
+}) {
+  return updateGreedRoundState({
+    roundId: params.roundId,
+    safeClicks: params.safeClicks,
+    currentMultiplier: params.currentMultiplier,
+    status: "closed",
+    result: params.result,
+    payout: params.payout,
+    payoutStatus: "recorded",
+    isActive: false,
+    endedAt: true,
+  });
+}
+
+// -------------------------------
+// 🍩 FEED YOUR GREED LEADERBOARDS
+// -------------------------------
+function greedWindowClause(window: string) {
+  if (window === "day") return `AND gr.created_at >= date_trunc('day', NOW())`;
+  if (window === "week") return `AND gr.created_at >= date_trunc('week', NOW())`;
+  if (window === "month") return `AND gr.created_at >= date_trunc('month', NOW())`;
+  return "";
+}
+
+export async function getGreedLeaderboard(params: {
+  board: "most_wagered" | "most_won" | "perfect_runs" | "biggest_cashout" | "top_glaze_sacrifices";
+  window: "lifetime" | "day" | "week" | "month";
+  limit?: number;
+}) {
+  const limit = Math.max(1, Math.min(200, Number(params.limit || 25)));
+  const whereTime = greedWindowClause(params.window);
+
+  let sql = "";
+  if (params.board === "most_wagered") {
+    sql = `
+      SELECT
+        gr.address,
+        u.display_name,
+        SUM(gr.wager)::BIGINT AS value
+      FROM greed_rounds gr
+      LEFT JOIN users u ON u.address = gr.address
+      WHERE gr.status = 'closed'
+        ${whereTime}
+      GROUP BY gr.address, u.display_name
+      ORDER BY value DESC
+      LIMIT $1;
+    `;
+  } else if (params.board === "most_won") {
+    sql = `
+      SELECT
+        gr.address,
+        u.display_name,
+        (COALESCE(SUM(gr.payout),0) - COALESCE(SUM(gr.wager),0))::BIGINT AS value
+      FROM greed_rounds gr
+      LEFT JOIN users u ON u.address = gr.address
+      WHERE gr.status = 'closed'
+        ${whereTime}
+      GROUP BY gr.address, u.display_name
+      ORDER BY value DESC
+      LIMIT $1;
+    `;
+  } else if (params.board === "perfect_runs") {
+    sql = `
+      SELECT
+        gr.address,
+        u.display_name,
+        COUNT(*)::BIGINT AS value
+      FROM greed_rounds gr
+      LEFT JOIN users u ON u.address = gr.address
+      WHERE gr.status = 'closed'
+        AND gr.result = 'perfect'
+        ${whereTime}
+      GROUP BY gr.address, u.display_name
+      ORDER BY value DESC
+      LIMIT $1;
+    `;
+  } else if (params.board === "biggest_cashout") {
+    sql = `
+      SELECT
+        gr.address,
+        u.display_name,
+        MAX(gr.payout)::BIGINT AS value
+      FROM greed_rounds gr
+      LEFT JOIN users u ON u.address = gr.address
+      WHERE gr.status = 'closed'
+        AND gr.result IN ('cashout', 'perfect')
+        ${whereTime}
+      GROUP BY gr.address, u.display_name
+      ORDER BY value DESC
+      LIMIT $1;
+    `;
+  } else {
+    sql = `
+      SELECT
+        gr.address,
+        u.display_name,
+        (COALESCE(SUM(gr.wager),0) - COALESCE(SUM(gr.payout),0))::BIGINT AS value
+      FROM greed_rounds gr
+      LEFT JOIN users u ON u.address = gr.address
+      WHERE gr.status = 'closed'
+        ${whereTime}
+      GROUP BY gr.address, u.display_name
+      HAVING (COALESCE(SUM(gr.wager),0) - COALESCE(SUM(gr.payout),0)) > 0
+      ORDER BY value DESC
+      LIMIT $1;
+    `;
+  }
+
+  const r = await pool.query(sql, [limit]);
+  return r.rows || [];
+}
+
+export async function getGreedFeed(limit = 20) {
+  const lim = Math.max(1, Math.min(100, Number(limit || 20)));
+  const r = await pool.query(
+    `
+    SELECT
+      gr.id,
+      gr.address,
+      u.display_name,
+      gr.wager,
+      gr.payout,
+      gr.safe_clicks,
+      gr.current_multiplier,
+      gr.result,
+      gr.created_at,
+      gr.ended_at
+    FROM greed_rounds gr
+    LEFT JOIN users u ON u.address = gr.address
+    WHERE gr.status = 'closed'
+    ORDER BY COALESCE(gr.ended_at, gr.created_at) DESC
+    LIMIT $1;
+    `,
+    [lim]
+  );
+
+  return r.rows || [];
 }
