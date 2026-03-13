@@ -30,8 +30,6 @@ const {
   setTelegramIdentity,
   upsertUser,
   pool,
-
-  // Greed hardened helpers
   createGreedRound,
   getActiveGreedRound,
   getGreedRoundByIdForAddress,
@@ -50,8 +48,6 @@ const app = express();
 
 const PORT = Number(process.env.PORT || 10000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
-// Telegram short name must be consistent with BotFather
 const TG_GAME_SHORT_NAME = String(process.env.TG_GAME_SHORT_NAME || "planetfatness").trim();
 
 app.use(express.json({ limit: "1mb" }));
@@ -97,7 +93,7 @@ function signTokenForAddress(address: string) {
 }
 
 // -------------------------------
-// Consistent calorie caps across other games
+// Other game rules
 // -------------------------------
 const COMMON_RULES = {
   minDurationMs: 10_000,
@@ -194,13 +190,10 @@ function computeEarnedCalories(params: { game: GameKey; score: number; miles: nu
 
   let base = 0;
 
-  if (game === "snack") {
-    base = score * 2.2;
-  } else if (game === "basket") {
-    base = score * 1.8;
-  } else if (game === "lift") {
-    base = score * 2.0;
-  } else if (game === "runner") {
+  if (game === "snack") base = score * 2.2;
+  else if (game === "basket") base = score * 1.8;
+  else if (game === "lift") base = score * 2.0;
+  else if (game === "runner") {
     base = miles * 110;
     if (!miles || miles <= 0) base = durationMin * 120;
   }
@@ -226,7 +219,7 @@ function computeDailyGoalProgress(params: { game: GameKey; today: { score: numbe
 }
 
 // -------------------------------
-// 🍩 FEED YOUR GREED CONFIG
+// Greed config
 // -------------------------------
 const GREED_TAX = 0.03;
 const GREED_MIN_WAGER = 1000;
@@ -242,18 +235,26 @@ function sanitizeWager(raw: any) {
   return wager;
 }
 
-function buildGreedPoisonIndices() {
-  const out: number[] = [];
-  while (out.length < GREED_POISON_COUNT) {
-    const r = Math.floor(Math.random() * GREED_TOTAL_DONUTS);
-    if (!out.includes(r)) out.push(r);
-  }
-  return out.sort((a, b) => a - b);
-}
-
 function getGreedMultiplierForSafeClicks(safeClicks: number) {
   if (safeClicks <= 0) return 1.0;
   return GREED_MULTIPLIERS[safeClicks - 1] || GREED_MULTIPLIERS[GREED_MULTIPLIERS.length - 1];
+}
+
+function sha256Hex(input: string) {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+function derivePoisonIndicesFromSeed(seed: string, total: number, poisonCount: number) {
+  const scores: { index: number; score: string }[] = [];
+  for (let i = 0; i < total; i++) {
+    scores.push({
+      index: i,
+      score: sha256Hex(`${seed}:${i}`),
+    });
+  }
+
+  scores.sort((a, b) => a.score.localeCompare(b.score));
+  return scores.slice(0, poisonCount).map((x) => x.index).sort((a, b) => a - b);
 }
 
 // -------------------------------
@@ -270,23 +271,23 @@ app.get("/", (_req: Request, res: Response) => {
         "Endpoints:",
         "  GET  /health",
         "  POST /auth/*",
-        "  GET  /profile/me                 (auth)",
-        "  POST /profile/name               (auth)",
-        "  GET  /activity/me                (auth)",
-        "  POST /activity/add               (auth)",
-        "  POST /activity/submit            (auth)",
-        "  GET  /activity/summary           (auth)",
-        "  GET  /daily/progress             (auth)",
+        "  GET  /profile/me",
+        "  POST /profile/name",
+        "  GET  /activity/me",
+        "  POST /activity/add",
+        "  POST /activity/submit",
+        "  GET  /activity/summary",
+        "  GET  /daily/progress",
         "  GET  /leaderboard",
-        "  GET  /leaderboard/v2             (window=day|week|month|lifetime)",
-        "  GET  /leaderboard/games          (window=day|week|month|lifetime)",
+        "  GET  /leaderboard/v2",
+        "  GET  /leaderboard/games",
         "  --- GREED GAME ---",
-        "  POST /greed/start                (auth)",
-        "  POST /greed/pick                 (auth)",
-        "  POST /greed/cashout              (auth)",
-        "  GET  /greed/active               (auth)",
-        "  GET  /greed/leaderboards         (public)",
-        "  GET  /greed/feed                 (public)",
+        "  POST /greed/start",
+        "  POST /greed/pick",
+        "  POST /greed/cashout",
+        "  GET  /greed/active",
+        "  GET  /greed/leaderboards",
+        "  GET  /greed/feed",
         "",
         "tapping counts as cardio 🟣🟡",
       ].join("\n")
@@ -303,9 +304,6 @@ app.get("/health", (_req: Request, res: Response) =>
 
 app.use("/auth", authRouter);
 
-/**
- * GET /profile/me (auth)
- */
 app.get("/profile/me", requireAuth, async (req: Request, res: Response) => {
   const address = (req as any).user?.address as string;
   const me = await getMe(address);
@@ -317,9 +315,6 @@ app.get("/profile/me", requireAuth, async (req: Request, res: Response) => {
   });
 });
 
-/**
- * POST /profile/name (auth)
- */
 app.post("/profile/name", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -337,9 +332,6 @@ app.post("/profile/name", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * GET /activity/me (auth)
- */
 app.get("/activity/me", requireAuth, async (req: Request, res: Response) => {
   const address = (req as any).user?.address as string;
   const me = await getMe(address);
@@ -354,9 +346,6 @@ app.get("/activity/me", requireAuth, async (req: Request, res: Response) => {
   });
 });
 
-/**
- * GET /activity/summary (auth)
- */
 app.get("/activity/summary", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -368,9 +357,6 @@ app.get("/activity/summary", requireAuth, async (req: Request, res: Response) =>
   }
 });
 
-/**
- * GET /daily/progress (auth)
- */
 app.get("/daily/progress", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -406,9 +392,6 @@ app.get("/daily/progress", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * POST /activity/add (auth) — legacy compatible + optional receipts
- */
 app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
   const address = (req as any).user?.address as string;
 
@@ -473,9 +456,6 @@ app.post("/activity/add", requireAuth, async (req: Request, res: Response) => {
   });
 });
 
-/**
- * POST /activity/submit (auth)
- */
 app.post("/activity/submit", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -559,12 +539,8 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
 });
 
 // -------------------------------
-// 🍩 FEED YOUR GREED API (HARDENED)
+// Greed API (provably fair)
 // -------------------------------
-/**
- * POST /greed/start
- * body: { wager }
- */
 app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -583,15 +559,17 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
     }
 
     const netStake = Math.floor(wager * (1 - GREED_TAX));
-    const poisonIndices = buildGreedPoisonIndices();
-    const seed = crypto.randomBytes(16).toString("hex");
+    const serverSeed = crypto.randomBytes(32).toString("hex");
+    const commitHash = sha256Hex(serverSeed);
+    const poisonIndices = derivePoisonIndicesFromSeed(serverSeed, GREED_TOTAL_DONUTS, GREED_POISON_COUNT);
 
     const round = await createGreedRound({
       address,
       wager,
       netStake,
       poisonIndices,
-      seed,
+      seed: serverSeed,
+      commitHash,
     });
 
     return res.json({
@@ -603,6 +581,9 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       poisonCount: GREED_POISON_COUNT,
       currentMultiplier: 1.0,
       cashoutAvailable: false,
+      provablyFair: {
+        commitHash,
+      },
     });
   } catch (e) {
     console.error(e);
@@ -610,10 +591,6 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * POST /greed/pick
- * body: { roundId, pickedIndex }
- */
 app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -654,7 +631,7 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
 
       const currentMultiplier = Number(round.current_multiplier || 1.0);
 
-      await closeGreedRoundAsPoison({
+      const closed = await closeGreedRoundAsPoison({
         roundId,
         safeClicks: Number(round.safe_clicks || 0),
         currentMultiplier,
@@ -667,6 +644,11 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         safeClicks: Number(round.safe_clicks || 0),
         currentMultiplier,
         payout: 0,
+        provablyFair: {
+          commitHash: closed.commit_hash,
+          serverSeed: closed.server_seed,
+          poisonIndices: closed.poison_indices,
+        },
       });
     }
 
@@ -682,7 +664,7 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
     if (newSafeClicks >= 10) {
       const payout = Math.floor(Number(round.net_stake) * newMultiplier);
 
-      await closeGreedRoundAsCashout({
+      const closed = await closeGreedRoundAsCashout({
         roundId,
         safeClicks: newSafeClicks,
         currentMultiplier: newMultiplier,
@@ -708,6 +690,11 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         currentMultiplier: newMultiplier,
         payout,
         cashoutAvailable: false,
+        provablyFair: {
+          commitHash: closed.commit_hash,
+          serverSeed: closed.server_seed,
+          poisonIndices: closed.poison_indices,
+        },
       });
     }
 
@@ -732,6 +719,9 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
       payout: 0,
       cashoutAvailable: newSafeClicks >= 1,
       finalDonutLive: newSafeClicks === 9,
+      provablyFair: {
+        commitHash: round.commit_hash,
+      },
     });
   } catch (e: any) {
     if (String(e?.message || "").includes("duplicate key")) {
@@ -742,10 +732,6 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * POST /greed/cashout
- * body: { roundId }
- */
 app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -772,7 +758,7 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
     const currentMultiplier = Number(round.current_multiplier || 1.0);
     const payout = Math.floor(Number(round.net_stake) * currentMultiplier);
 
-    await closeGreedRoundAsCashout({
+    const closed = await closeGreedRoundAsCashout({
       roundId,
       safeClicks,
       currentMultiplier,
@@ -797,6 +783,11 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
       safeClicks,
       currentMultiplier,
       payout,
+      provablyFair: {
+        commitHash: closed.commit_hash,
+        serverSeed: closed.server_seed,
+        poisonIndices: closed.poison_indices,
+      },
     });
   } catch (e) {
     console.error(e);
@@ -804,9 +795,6 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * GET /greed/active
- */
 app.get("/greed/active", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -828,6 +816,9 @@ app.get("/greed/active", requireAuth, async (req: Request, res: Response) => {
         currentMultiplier: Number(round.current_multiplier || 1.0),
         pickedIndices,
         cashoutAvailable: Number(round.safe_clicks || 0) >= 1,
+        provablyFair: {
+          commitHash: round.commit_hash,
+        },
       },
     });
   } catch (e) {
@@ -836,10 +827,6 @@ app.get("/greed/active", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * GET /greed/leaderboards
- * query: window=day|week|month|lifetime&limit=10
- */
 app.get("/greed/leaderboards", async (req: Request, res: Response) => {
   try {
     const window = normalizeWindow(req.query.window || "lifetime");
@@ -870,9 +857,6 @@ app.get("/greed/leaderboards", async (req: Request, res: Response) => {
   }
 });
 
-/**
- * GET /greed/feed
- */
 app.get("/greed/feed", async (req: Request, res: Response) => {
   try {
     const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
@@ -884,10 +868,6 @@ app.get("/greed/feed", async (req: Request, res: Response) => {
   }
 });
 
-// -------------------------------
-/**
- * GET /leaderboard (legacy)
- */
 app.get("/leaderboard", async (_req: Request, res: Response) => {
   const top = await getLeaderboard(30);
   res.json(
@@ -901,9 +881,6 @@ app.get("/leaderboard", async (_req: Request, res: Response) => {
   );
 });
 
-/**
- * GET /leaderboard/v2
- */
 app.get("/leaderboard/v2", async (req: Request, res: Response) => {
   try {
     const window = normalizeWindow(req.query.window || "lifetime") as any;
@@ -922,9 +899,6 @@ app.get("/leaderboard/v2", async (req: Request, res: Response) => {
   }
 });
 
-/**
- * GET /leaderboard/games
- */
 app.get("/leaderboard/games", async (req: Request, res: Response) => {
   try {
     const window = normalizeWindow(req.query.window || "lifetime");
@@ -951,9 +925,6 @@ app.get("/leaderboard/games", async (req: Request, res: Response) => {
   }
 });
 
-/**
- * Admin reset
- */
 app.get("/admin/launch-reset", async (req: Request, res: Response) => {
   const secret = req.query.secret;
   if (secret !== "launch2026") return res.status(403).send("Unauthorized");
@@ -973,9 +944,7 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
 
     try {
       await pool.query(`UPDATE pf_users SET total_calories = 0;`);
-    } catch {
-      // ignore if pf_users does not exist in this environment
-    }
+    } catch {}
 
     res.type("text/plain").send("✅ Planet Fatness deep cleaned.");
   } catch (err: any) {
@@ -984,7 +953,7 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
 });
 
 // -------------------------------
-// ✅ TELEGRAM BOT ENGINE (GREED / GAME LAUNCH)
+// Telegram game launch
 // -------------------------------
 const bot = new Telegraf(process.env.GREED_BOT_TOKEN || "");
 
@@ -1028,9 +997,7 @@ bot.on("callback_query", async (ctx) => {
       if (displayName && displayName.trim().length >= 2) {
         try {
           await setDisplayName({ address, displayName });
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
     } catch (e) {
       console.error("TG game upsert/identity failed:", e);
@@ -1057,9 +1024,7 @@ bot.on("callback_query", async (ctx) => {
   }
 });
 
-// -----------------------------------------------------------
-// ✅ GYM BOT ENGINE (PLANET FATNESS MAIN APP)
-// -----------------------------------------------------------
+// Main gym bot
 const gymBot = new Telegraf(process.env.TG_BOT_TOKEN || "");
 
 gymBot.start((ctx) => {
