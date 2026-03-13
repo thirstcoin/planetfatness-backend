@@ -34,7 +34,6 @@ export async function initDb() {
     ADD COLUMN IF NOT EXISTS display_name TEXT;
   `);
 
-  // Telegram identity columns
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS tg_id BIGINT,
@@ -46,13 +45,12 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_username ON users(tg_username);`);
 
-  // Basketball lifetime
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS lifetime_makes BIGINT NOT NULL DEFAULT 0;
   `);
 
-  // Sessions table = receipts (per-run logging)
+  // Sessions table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       id BIGSERIAL PRIMARY KEY,
@@ -75,7 +73,7 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_address_created ON sessions(address, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_game_created ON sessions(game, created_at DESC);`);
 
-  // 🍩 FEED YOUR GREED ROUNDS
+  // Greed rounds
   await pool.query(`
     CREATE TABLE IF NOT EXISTS greed_rounds (
       id BIGSERIAL PRIMARY KEY,
@@ -84,6 +82,7 @@ export async function initDb() {
       net_stake BIGINT NOT NULL,
       poison_indices INTEGER[] NOT NULL,
       server_seed TEXT NOT NULL,
+      commit_hash TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'active',
       result TEXT,
       safe_clicks INT NOT NULL DEFAULT 0,
@@ -93,7 +92,8 @@ export async function initDb() {
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      ended_at TIMESTAMPTZ
+      ended_at TIMESTAMPTZ,
+      revealed_at TIMESTAMPTZ
     );
   `);
 
@@ -103,7 +103,9 @@ export async function initDb() {
     ADD COLUMN IF NOT EXISTS current_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     ADD COLUMN IF NOT EXISTS payout_status TEXT NOT NULL DEFAULT 'unpaid',
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS revealed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS commit_hash TEXT NOT NULL DEFAULT '';
   `);
 
   await pool.query(`
@@ -114,7 +116,7 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_address ON greed_rounds(address);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_status_created ON greed_rounds(status, created_at DESC);`);
 
-  // 🍩 FEED YOUR GREED PICKS (audit trail / anti-replay)
+  // Greed picks
   await pool.query(`
     CREATE TABLE IF NOT EXISTS greed_picks (
       id BIGSERIAL PRIMARY KEY,
@@ -128,7 +130,7 @@ export async function initDb() {
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_picks_round ON greed_picks(round_id, created_at ASC);`);
 
-  console.log("✅ DB ready (TG + games + hardened Greed)");
+  console.log("✅ DB ready (TG + games + hardened Greed + provably fair)");
 }
 
 // -------------------------------
@@ -318,7 +320,7 @@ export async function logSession(params: {
 }
 
 // -------------------------------
-// Leaderboard V2 (existing games)
+// Leaderboard V2
 // -------------------------------
 export async function getLeaderboardV2(params: {
   window: "lifetime" | "day" | "week" | "month" | string;
@@ -529,7 +531,7 @@ export async function getActivitySummary(params: { address: string }) {
 }
 
 // -------------------------------
-// 🍩 FEED YOUR GREED LOGIC
+// Greed logic
 // -------------------------------
 export async function createGreedRound(params: {
   address: string;
@@ -537,6 +539,7 @@ export async function createGreedRound(params: {
   netStake: number;
   poisonIndices: number[];
   seed: string;
+  commitHash: string;
 }) {
   await upsertUser(params.address);
 
@@ -548,6 +551,7 @@ export async function createGreedRound(params: {
       net_stake,
       poison_indices,
       server_seed,
+      commit_hash,
       status,
       result,
       safe_clicks,
@@ -558,10 +562,17 @@ export async function createGreedRound(params: {
       created_at,
       updated_at
     )
-    VALUES ($1, $2, $3, $4, $5, 'active', NULL, 0, 1.0, 0, 'unpaid', TRUE, NOW(), NOW())
+    VALUES ($1, $2, $3, $4, $5, $6, 'active', NULL, 0, 1.0, 0, 'unpaid', TRUE, NOW(), NOW())
     RETURNING *;
     `,
-    [params.address, Math.floor(params.wager), Math.floor(params.netStake), params.poisonIndices, params.seed]
+    [
+      params.address,
+      Math.floor(params.wager),
+      Math.floor(params.netStake),
+      params.poisonIndices,
+      params.seed,
+      params.commitHash,
+    ]
   );
 
   return r.rows[0] || null;
@@ -624,16 +635,10 @@ export async function recordGreedPick(params: {
   return r.rows[0] || null;
 }
 
-export async function updateGreedRoundState(params: {
+export async function closeGreedRoundAsPoison(params: {
   roundId: number;
   safeClicks: number;
   currentMultiplier: number;
-  status?: string;
-  result?: string | null;
-  payout?: number;
-  payoutStatus?: string;
-  isActive?: boolean;
-  endedAt?: boolean;
 }) {
   const r = await pool.query(
     `
@@ -641,48 +646,21 @@ export async function updateGreedRoundState(params: {
     SET
       safe_clicks = $2,
       current_multiplier = $3,
-      status = COALESCE($4, status),
-      result = COALESCE($5, result),
-      payout = COALESCE($6, payout),
-      payout_status = COALESCE($7, payout_status),
-      is_active = COALESCE($8, is_active),
+      status = 'closed',
+      result = 'poison',
+      payout = 0,
+      payout_status = 'unpaid',
+      is_active = FALSE,
       updated_at = NOW(),
-      ended_at = CASE WHEN $9 THEN NOW() ELSE ended_at END
+      ended_at = NOW(),
+      revealed_at = NOW()
     WHERE id = $1
     RETURNING *;
     `,
-    [
-      params.roundId,
-      params.safeClicks,
-      params.currentMultiplier,
-      params.status ?? null,
-      params.result ?? null,
-      params.payout != null ? Math.floor(params.payout) : null,
-      params.payoutStatus ?? null,
-      params.isActive != null ? params.isActive : null,
-      params.endedAt === true,
-    ]
+    [params.roundId, params.safeClicks, params.currentMultiplier]
   );
 
   return r.rows[0] || null;
-}
-
-export async function closeGreedRoundAsPoison(params: {
-  roundId: number;
-  safeClicks: number;
-  currentMultiplier: number;
-}) {
-  return updateGreedRoundState({
-    roundId: params.roundId,
-    safeClicks: params.safeClicks,
-    currentMultiplier: params.currentMultiplier,
-    status: "closed",
-    result: "poison",
-    payout: 0,
-    payoutStatus: "unpaid",
-    isActive: false,
-    endedAt: true,
-  });
 }
 
 export async function closeGreedRoundAsCashout(params: {
@@ -692,21 +670,31 @@ export async function closeGreedRoundAsCashout(params: {
   payout: number;
   result: "cashout" | "perfect";
 }) {
-  return updateGreedRoundState({
-    roundId: params.roundId,
-    safeClicks: params.safeClicks,
-    currentMultiplier: params.currentMultiplier,
-    status: "closed",
-    result: params.result,
-    payout: params.payout,
-    payoutStatus: "recorded",
-    isActive: false,
-    endedAt: true,
-  });
+  const r = await pool.query(
+    `
+    UPDATE greed_rounds
+    SET
+      safe_clicks = $2,
+      current_multiplier = $3,
+      status = 'closed',
+      result = $4,
+      payout = $5,
+      payout_status = 'recorded',
+      is_active = FALSE,
+      updated_at = NOW(),
+      ended_at = NOW(),
+      revealed_at = NOW()
+    WHERE id = $1
+    RETURNING *;
+    `,
+    [params.roundId, params.safeClicks, params.currentMultiplier, params.result, Math.floor(params.payout)]
+  );
+
+  return r.rows[0] || null;
 }
 
 // -------------------------------
-// 🍩 FEED YOUR GREED LEADERBOARDS
+// Greed leaderboards
 // -------------------------------
 function greedWindowClause(window: string) {
   if (window === "day") return `AND gr.created_at >= date_trunc('day', NOW())`;
@@ -816,8 +804,12 @@ export async function getGreedFeed(limit = 20) {
       gr.safe_clicks,
       gr.current_multiplier,
       gr.result,
+      gr.commit_hash,
+      gr.server_seed,
+      gr.poison_indices,
       gr.created_at,
-      gr.ended_at
+      gr.ended_at,
+      gr.revealed_at
     FROM greed_rounds gr
     LEFT JOIN users u ON u.address = gr.address
     WHERE gr.status = 'closed'
