@@ -90,6 +90,7 @@ export async function initDb() {
       payout BIGINT NOT NULL DEFAULT 0,
       payout_status TEXT NOT NULL DEFAULT 'unpaid',
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      is_processing BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       ended_at TIMESTAMPTZ,
@@ -102,6 +103,7 @@ export async function initDb() {
     ADD COLUMN IF NOT EXISTS result TEXT,
     ADD COLUMN IF NOT EXISTS current_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     ADD COLUMN IF NOT EXISTS payout_status TEXT NOT NULL DEFAULT 'unpaid',
+    ADD COLUMN IF NOT EXISTS is_processing BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS revealed_at TIMESTAMPTZ,
@@ -130,7 +132,7 @@ export async function initDb() {
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_picks_round ON greed_picks(round_id, created_at ASC);`);
 
-  console.log("✅ DB ready (TG + games + hardened Greed + provably fair)");
+  console.log("✅ DB ready (TG + games + hardened Greed + provably fair + action locks)");
 }
 
 // -------------------------------
@@ -559,10 +561,11 @@ export async function createGreedRound(params: {
       payout,
       payout_status,
       is_active,
+      is_processing,
       created_at,
       updated_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, 'active', NULL, 0, 1.0, 0, 'unpaid', TRUE, NOW(), NOW())
+    VALUES ($1, $2, $3, $4, $5, $6, 'active', NULL, 0, 1.0, 0, 'unpaid', TRUE, FALSE, NOW(), NOW())
     RETURNING *;
     `,
     [
@@ -585,7 +588,7 @@ export async function getActiveGreedRound(address: string) {
     FROM greed_rounds
     WHERE address = $1 AND status = 'active' AND is_active = TRUE
     ORDER BY created_at DESC
-    LIMIT 1;
+    LIMIT $1;
     `,
     [address]
   );
@@ -635,8 +638,55 @@ export async function recordGreedPick(params: {
   return r.rows[0] || null;
 }
 
-export async function closeGreedRoundAsPoison(params: {
+// -------------------------------
+// Greed action lock helpers
+// -------------------------------
+export async function acquireGreedRoundProcessingLock(params: {
   roundId: number;
+  address: string;
+}) {
+  const r = await pool.query(
+    `
+    UPDATE greed_rounds
+    SET
+      is_processing = TRUE,
+      updated_at = NOW()
+    WHERE id = $1
+      AND address = $2
+      AND status = 'active'
+      AND is_active = TRUE
+      AND is_processing = FALSE
+    RETURNING *;
+    `,
+    [params.roundId, params.address]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function releaseGreedRoundProcessingLock(params: {
+  roundId: number;
+  address: string;
+}) {
+  const r = await pool.query(
+    `
+    UPDATE greed_rounds
+    SET
+      is_processing = FALSE,
+      updated_at = NOW()
+    WHERE id = $1
+      AND address = $2
+    RETURNING *;
+    `,
+    [params.roundId, params.address]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function updateGreedRoundProgress(params: {
+  roundId: number;
+  address: string;
   safeClicks: number;
   currentMultiplier: number;
 }) {
@@ -644,20 +694,49 @@ export async function closeGreedRoundAsPoison(params: {
     `
     UPDATE greed_rounds
     SET
-      safe_clicks = $2,
-      current_multiplier = $3,
+      safe_clicks = $3,
+      current_multiplier = $4,
+      updated_at = NOW()
+    WHERE id = $1
+      AND address = $2
+      AND status = 'active'
+      AND is_active = TRUE
+    RETURNING *;
+    `,
+    [params.roundId, params.address, params.safeClicks, params.currentMultiplier]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function closeGreedRoundAsPoison(params: {
+  roundId: number;
+  address: string;
+  safeClicks: number;
+  currentMultiplier: number;
+}) {
+  const r = await pool.query(
+    `
+    UPDATE greed_rounds
+    SET
+      safe_clicks = $3,
+      current_multiplier = $4,
       status = 'closed',
       result = 'poison',
       payout = 0,
       payout_status = 'unpaid',
       is_active = FALSE,
+      is_processing = FALSE,
       updated_at = NOW(),
       ended_at = NOW(),
       revealed_at = NOW()
     WHERE id = $1
+      AND address = $2
+      AND status = 'active'
+      AND is_active = TRUE
     RETURNING *;
     `,
-    [params.roundId, params.safeClicks, params.currentMultiplier]
+    [params.roundId, params.address, params.safeClicks, params.currentMultiplier]
   );
 
   return r.rows[0] || null;
@@ -665,6 +744,7 @@ export async function closeGreedRoundAsPoison(params: {
 
 export async function closeGreedRoundAsCashout(params: {
   roundId: number;
+  address: string;
   safeClicks: number;
   currentMultiplier: number;
   payout: number;
@@ -674,20 +754,25 @@ export async function closeGreedRoundAsCashout(params: {
     `
     UPDATE greed_rounds
     SET
-      safe_clicks = $2,
-      current_multiplier = $3,
+      safe_clicks = $3,
+      current_multiplier = $4,
       status = 'closed',
-      result = $4,
-      payout = $5,
+      result = $5,
+      payout = $6,
       payout_status = 'recorded',
       is_active = FALSE,
+      is_processing = FALSE,
       updated_at = NOW(),
       ended_at = NOW(),
       revealed_at = NOW()
     WHERE id = $1
+      AND address = $2
+      AND status = 'active'
+      AND is_active = TRUE
+      AND payout_status = 'unpaid'
     RETURNING *;
     `,
-    [params.roundId, params.safeClicks, params.currentMultiplier, params.result, Math.floor(params.payout)]
+    [params.roundId, params.address, params.safeClicks, params.currentMultiplier, params.result, Math.floor(params.payout)]
   );
 
   return r.rows[0] || null;
