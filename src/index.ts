@@ -35,6 +35,9 @@ const {
   getGreedRoundByIdForAddress,
   getGreedPickedIndices,
   recordGreedPick,
+  acquireGreedRoundProcessingLock,
+  releaseGreedRoundProcessingLock,
+  updateGreedRoundProgress,
   closeGreedRoundAsPoison,
   closeGreedRoundAsCashout,
   getGreedLeaderboard,
@@ -539,7 +542,7 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
 });
 
 // -------------------------------
-// Greed API (provably fair)
+// Greed API (provably fair + action locking)
 // -------------------------------
 app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
   try {
@@ -592,6 +595,8 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
 });
 
 app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
+  let lockAcquired = false;
+
   try {
     const address = (req as any).user?.address as string;
     const roundId = Math.floor(Number(req.body?.roundId));
@@ -614,12 +619,28 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Round is not active" });
     }
 
+    const lockedRound = await acquireGreedRoundProcessingLock({
+      roundId,
+      address,
+    });
+
+    if (!lockedRound) {
+      return res.status(409).json({ error: "Round is busy processing another action" });
+    }
+
+    lockAcquired = true;
+
     const pickedAlready = await getGreedPickedIndices(roundId);
     if (pickedAlready.includes(pickedIndex)) {
+      await releaseGreedRoundProcessingLock({ roundId, address });
+      lockAcquired = false;
       return res.status(400).json({ error: "Donut already picked" });
     }
 
-    const poisonIndices = Array.isArray(round.poison_indices) ? round.poison_indices.map((n: any) => Number(n)) : [];
+    const poisonIndices = Array.isArray(lockedRound.poison_indices)
+      ? lockedRound.poison_indices.map((n: any) => Number(n))
+      : [];
+
     const isPoison = poisonIndices.includes(pickedIndex);
 
     if (isPoison) {
@@ -629,20 +650,27 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         result: "poison",
       });
 
-      const currentMultiplier = Number(round.current_multiplier || 1.0);
+      const currentMultiplier = Number(lockedRound.current_multiplier || 1.0);
 
       const closed = await closeGreedRoundAsPoison({
         roundId,
-        safeClicks: Number(round.safe_clicks || 0),
+        address,
+        safeClicks: Number(lockedRound.safe_clicks || 0),
         currentMultiplier,
       });
+
+      lockAcquired = false;
+
+      if (!closed) {
+        return res.status(409).json({ error: "Round could not be closed" });
+      }
 
       return res.json({
         ok: true,
         result: "poison",
         roundEnded: true,
-        safeClicks: Number(round.safe_clicks || 0),
-        currentMultiplier,
+        safeClicks: Number(closed.safe_clicks || 0),
+        currentMultiplier: Number(closed.current_multiplier || currentMultiplier),
         payout: 0,
         provablyFair: {
           commitHash: closed.commit_hash,
@@ -652,25 +680,32 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
       });
     }
 
-    const newSafeClicks = Number(round.safe_clicks || 0) + 1;
-    const newMultiplier = getGreedMultiplierForSafeClicks(newSafeClicks);
-
     await recordGreedPick({
       roundId,
       donutIndex: pickedIndex,
       result: "safe",
     });
 
+    const newSafeClicks = Number(lockedRound.safe_clicks || 0) + 1;
+    const newMultiplier = getGreedMultiplierForSafeClicks(newSafeClicks);
+
     if (newSafeClicks >= 10) {
-      const payout = Math.floor(Number(round.net_stake) * newMultiplier);
+      const payout = Math.floor(Number(lockedRound.net_stake) * newMultiplier);
 
       const closed = await closeGreedRoundAsCashout({
         roundId,
+        address,
         safeClicks: newSafeClicks,
         currentMultiplier: newMultiplier,
         payout,
         result: "perfect",
       });
+
+      lockAcquired = false;
+
+      if (!closed) {
+        return res.status(409).json({ error: "Perfect run close failed" });
+      }
 
       await logSession({
         address,
@@ -698,17 +733,19 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
       });
     }
 
-    await pool.query(
-      `
-      UPDATE greed_rounds
-      SET
-        safe_clicks = $2,
-        current_multiplier = $3,
-        updated_at = NOW()
-      WHERE id = $1;
-      `,
-      [roundId, newSafeClicks, newMultiplier]
-    );
+    const updated = await updateGreedRoundProgress({
+      roundId,
+      address,
+      safeClicks: newSafeClicks,
+      currentMultiplier: newMultiplier,
+    });
+
+    await releaseGreedRoundProcessingLock({ roundId, address });
+    lockAcquired = false;
+
+    if (!updated) {
+      return res.status(409).json({ error: "Round progress update failed" });
+    }
 
     return res.json({
       ok: true,
@@ -720,7 +757,7 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
       cashoutAvailable: newSafeClicks >= 1,
       finalDonutLive: newSafeClicks === 9,
       provablyFair: {
-        commitHash: round.commit_hash,
+        commitHash: updated.commit_hash,
       },
     });
   } catch (e: any) {
@@ -729,10 +766,22 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
     }
     console.error(e);
     return res.status(500).json({ error: "Greed pick failed" });
+  } finally {
+    if (lockAcquired) {
+      try {
+        const address = (req as any).user?.address as string;
+        const roundId = Math.floor(Number(req.body?.roundId));
+        if (Number.isFinite(roundId) && roundId > 0 && address) {
+          await releaseGreedRoundProcessingLock({ roundId, address });
+        }
+      } catch {}
+    }
   }
 });
 
 app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
+  let lockAcquired = false;
+
   try {
     const address = (req as any).user?.address as string;
     const roundId = Math.floor(Number(req.body?.roundId));
@@ -750,21 +799,47 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Round is not active" });
     }
 
-    const safeClicks = Number(round.safe_clicks || 0);
+    const lockedRound = await acquireGreedRoundProcessingLock({
+      roundId,
+      address,
+    });
+
+    if (!lockedRound) {
+      return res.status(409).json({ error: "Round is busy processing another action" });
+    }
+
+    lockAcquired = true;
+
+    const safeClicks = Number(lockedRound.safe_clicks || 0);
     if (safeClicks < 1) {
+      await releaseGreedRoundProcessingLock({ roundId, address });
+      lockAcquired = false;
       return res.status(400).json({ error: "Cashout not available yet" });
     }
 
-    const currentMultiplier = Number(round.current_multiplier || 1.0);
-    const payout = Math.floor(Number(round.net_stake) * currentMultiplier);
+    if (String(lockedRound.payout_status || "unpaid") !== "unpaid") {
+      await releaseGreedRoundProcessingLock({ roundId, address });
+      lockAcquired = false;
+      return res.status(409).json({ error: "Payout already recorded for this round" });
+    }
+
+    const currentMultiplier = Number(lockedRound.current_multiplier || 1.0);
+    const payout = Math.floor(Number(lockedRound.net_stake) * currentMultiplier);
 
     const closed = await closeGreedRoundAsCashout({
       roundId,
+      address,
       safeClicks,
       currentMultiplier,
       payout,
       result: "cashout",
     });
+
+    lockAcquired = false;
+
+    if (!closed) {
+      return res.status(409).json({ error: "Cashout close failed" });
+    }
 
     await logSession({
       address,
@@ -792,6 +867,16 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Greed cashout failed" });
+  } finally {
+    if (lockAcquired) {
+      try {
+        const address = (req as any).user?.address as string;
+        const roundId = Math.floor(Number(req.body?.roundId));
+        if (Number.isFinite(roundId) && roundId > 0 && address) {
+          await releaseGreedRoundProcessingLock({ roundId, address });
+        }
+      } catch {}
+    }
   }
 });
 
