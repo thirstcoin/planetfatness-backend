@@ -30,6 +30,16 @@ const {
   setTelegramIdentity,
   upsertUser,
   pool,
+  getBalance,
+  creditBalance,
+  debitBalance,
+  hasDepositTxSignature,
+  recordDeposit,
+  createWithdrawal,
+  getGreedJackpotState,
+  setGreedJackpotAmount,
+  addToGreedJackpot,
+  reseedGreedJackpot,
   createGreedRound,
   getActiveGreedRound,
   getGreedRoundByIdForAddress,
@@ -52,6 +62,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 10000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 const TG_GAME_SHORT_NAME = String(process.env.TG_GAME_SHORT_NAME || "planetfatness").trim();
+const ADMIN_SECRET = String(process.env.ADMIN_SECRET || "launch2026").trim();
 
 app.use(express.json({ limit: "1mb" }));
 app.use(
@@ -70,7 +81,7 @@ function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
 }
 
-function asGameKey(x: any): GameKey {
+function asGameKey(x: unknown): GameKey {
   const g = String(x || "").toLowerCase().trim();
   if (g === "runner" || g === "snack" || g === "lift" || g === "basket" || g === "greed") return g as GameKey;
   return "snack";
@@ -80,7 +91,7 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function normalizeWindow(w: any): "lifetime" | "day" | "week" | "month" {
+function normalizeWindow(w: unknown): "lifetime" | "day" | "week" | "month" {
   const s = String(w || "lifetime").toLowerCase().trim();
   if (s === "daily") return "day";
   if (s === "weekly") return "week";
@@ -93,6 +104,23 @@ function signTokenForAddress(address: string) {
   const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
   if (!JWT_SECRET) throw new Error("missing_jwt_secret");
   return jwt.sign({ address }, JWT_SECRET, { expiresIn: "30d" });
+}
+
+function sha256Hex(input: string) {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+function requireAdmin(req: Request, res: Response): boolean {
+  const headerSecret = String(req.headers["x-admin-secret"] || "").trim();
+  const querySecret = String(req.query.secret || "").trim();
+  const bodySecret = String((req.body as { secret?: string } | undefined)?.secret || "").trim();
+  const provided = headerSecret || querySecret || bodySecret;
+
+  if (!ADMIN_SECRET || provided !== ADMIN_SECRET) {
+    res.status(403).json({ error: "Unauthorized" });
+    return false;
+  }
+  return true;
 }
 
 // -------------------------------
@@ -224,14 +252,16 @@ function computeDailyGoalProgress(params: { game: GameKey; today: { score: numbe
 // -------------------------------
 // Greed config
 // -------------------------------
-const GREED_TAX = 0.03;
+const GREED_TAX = 0.05;
+const GREED_JACKPOT_FEED_RATE = 0.00625;
 const GREED_MIN_WAGER = 1000;
-const GREED_MAX_WAGER = 100000;
+const GREED_MAX_WAGER = 50000;
 const GREED_TOTAL_DONUTS = 12;
 const GREED_POISON_COUNT = 2;
+const GREED_JACKPOT_RESEED = 5000;
 const GREED_MULTIPLIERS = [1.02, 1.07, 1.15, 1.30, 1.48, 1.70, 1.98, 2.28, 2.70, 3.50];
 
-function sanitizeWager(raw: any) {
+function sanitizeWager(raw: unknown) {
   const wager = Math.floor(Number(raw));
   if (!Number.isFinite(wager)) return null;
   if (wager < GREED_MIN_WAGER || wager > GREED_MAX_WAGER) return null;
@@ -243,16 +273,12 @@ function getGreedMultiplierForSafeClicks(safeClicks: number) {
   return GREED_MULTIPLIERS[safeClicks - 1] || GREED_MULTIPLIERS[GREED_MULTIPLIERS.length - 1];
 }
 
-function sha256Hex(input: string) {
-  return crypto.createHash("sha256").update(input).digest("hex");
-}
-
-function derivePoisonIndicesFromSeed(seed: string, total: number, poisonCount: number) {
-  const scores: { index: number; score: string }[] = [];
+function derivePoisonIndicesFromSeed(seed: string, nonce: number, total: number, poisonCount: number) {
+  const scores: Array<{ index: number; score: string }> = [];
   for (let i = 0; i < total; i++) {
     scores.push({
       index: i,
-      score: sha256Hex(`${seed}:${i}`),
+      score: sha256Hex(`${seed}:${nonce}:${i}`),
     });
   }
 
@@ -284,7 +310,10 @@ app.get("/", (_req: Request, res: Response) => {
         "  GET  /leaderboard",
         "  GET  /leaderboard/v2",
         "  GET  /leaderboard/games",
-        "  --- GREED GAME ---",
+        "  GET  /wallet/balance",
+        "  GET  /wallet/deposit-info",
+        "  POST /wallet/withdraw",
+        "  GET  /greed/jackpot",
         "  POST /greed/start",
         "  POST /greed/pick",
         "  POST /greed/cashout",
@@ -307,14 +336,85 @@ app.get("/health", (_req: Request, res: Response) =>
 
 app.use("/auth", authRouter);
 
+// -------------------------------
+// Wallet / balance
+// -------------------------------
+app.get("/wallet/balance", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const address = (req as any).user?.address as string;
+    const balance = await getBalance(address);
+
+    return res.json({
+      ok: true,
+      address,
+      balance,
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch balance" });
+  }
+});
+
+app.get("/wallet/deposit-info", requireAuth, async (_req: Request, res: Response) => {
+  return res.json({
+    ok: true,
+    depositWallet: String(process.env.DEPOSIT_WALLET || "").trim() || null,
+    bankrollWallet: String(process.env.BANKROLL_WALLET || "").trim() || null,
+    jackpotWallet: String(process.env.JACKPOT_WALLET || "").trim() || null,
+    treasuryWallet: String(process.env.TREASURY_WALLET || "").trim() || null,
+    acceptedToken: String(process.env.PHAT_TOKEN_MINT || "").trim() || "PHAT",
+    mode: "internal-balance",
+  });
+});
+
+app.post("/wallet/withdraw", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const address = (req as any).user?.address as string;
+    const amount = Math.floor(Number(req.body?.amount));
+    const destinationWallet = String(req.body?.destinationWallet || address).trim();
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Invalid amount" });
+    }
+
+    const bal = await getBalance(address);
+    const available = Number(bal?.available_balance || 0);
+    if (available < amount) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    await debitBalance({ address, amount });
+    const row = await createWithdrawal({
+      address,
+      destinationWallet,
+      amount,
+      note: "user withdrawal request",
+    });
+
+    return res.json({
+      ok: true,
+      withdrawal: row,
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Withdrawal request failed" });
+  }
+});
+
+// -------------------------------
+// Profile / activity
+// -------------------------------
 app.get("/profile/me", requireAuth, async (req: Request, res: Response) => {
   const address = (req as any).user?.address as string;
   const me = await getMe(address);
   if (!me) return res.status(404).json({ error: "User not found" });
 
+  const balance = await getBalance(address);
+
   res.json({
     address: me.address,
     displayName: me.display_name || null,
+    balance,
   });
 });
 
@@ -542,8 +642,18 @@ app.post("/activity/submit", requireAuth, async (req: Request, res: Response) =>
 });
 
 // -------------------------------
-// Greed API (provably fair + action locking)
+// Greed API
 // -------------------------------
+app.get("/greed/jackpot", async (_req: Request, res: Response) => {
+  try {
+    const row = await getGreedJackpotState();
+    return res.json({ ok: true, jackpot: row });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch jackpot" });
+  }
+});
+
 app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -561,10 +671,25 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       });
     }
 
+    const balance = await getBalance(address);
+    const availableBalance = Number(balance?.available_balance || 0);
+    if (availableBalance < wager) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    const debited = await debitBalance({ address, amount: wager });
+    if (!debited) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
     const netStake = Math.floor(wager * (1 - GREED_TAX));
+    const jackpotFeed = Math.floor(wager * GREED_JACKPOT_FEED_RATE);
+    await addToGreedJackpot(jackpotFeed);
+
     const serverSeed = crypto.randomBytes(32).toString("hex");
     const commitHash = sha256Hex(serverSeed);
-    const poisonIndices = derivePoisonIndicesFromSeed(serverSeed, GREED_TOTAL_DONUTS, GREED_POISON_COUNT);
+    const nonce = Date.now();
+    const poisonIndices = derivePoisonIndicesFromSeed(serverSeed, nonce, GREED_TOTAL_DONUTS, GREED_POISON_COUNT);
 
     const round = await createGreedRound({
       address,
@@ -573,6 +698,7 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       poisonIndices,
       seed: serverSeed,
       commitHash,
+      nonce,
     });
 
     return res.json({
@@ -580,12 +706,14 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       roundId: round.id,
       wager,
       netStake,
+      jackpotFeed,
       totalDonuts: GREED_TOTAL_DONUTS,
       poisonCount: GREED_POISON_COUNT,
       currentMultiplier: 1.0,
       cashoutAvailable: false,
       provablyFair: {
         commitHash,
+        nonce,
       },
     });
   } catch (e) {
@@ -638,7 +766,7 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
     }
 
     const poisonIndices = Array.isArray(lockedRound.poison_indices)
-      ? lockedRound.poison_indices.map((n: any) => Number(n))
+      ? lockedRound.poison_indices.map((n: unknown) => Number(n))
       : [];
 
     const isPoison = poisonIndices.includes(pickedIndex);
@@ -672,9 +800,11 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         safeClicks: Number(closed.safe_clicks || 0),
         currentMultiplier: Number(closed.current_multiplier || currentMultiplier),
         payout: 0,
+        jackpotWon: 0,
         provablyFair: {
           commitHash: closed.commit_hash,
           serverSeed: closed.server_seed,
+          nonce: Number(closed.nonce || 1),
           poisonIndices: closed.poison_indices,
         },
       });
@@ -690,15 +820,19 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
     const newMultiplier = getGreedMultiplierForSafeClicks(newSafeClicks);
 
     if (newSafeClicks >= 10) {
-      const payout = Math.floor(Number(lockedRound.net_stake) * newMultiplier);
+      const jackpotState = await getGreedJackpotState();
+      const jackpotWon = Number(jackpotState?.current_amount || 0);
+      const basePayout = Math.floor(Number(lockedRound.net_stake) * newMultiplier);
+      const totalPayout = basePayout + jackpotWon;
 
       const closed = await closeGreedRoundAsCashout({
         roundId,
         address,
         safeClicks: newSafeClicks,
         currentMultiplier: newMultiplier,
-        payout,
+        payout: totalPayout,
         result: "perfect",
+        jackpotWon,
       });
 
       lockAcquired = false;
@@ -707,13 +841,16 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         return res.status(409).json({ error: "Perfect run close failed" });
       }
 
+      await creditBalance({ address, amount: totalPayout });
+      await reseedGreedJackpot();
+
       await logSession({
         address,
         game: "greed",
         calories: 0,
         miles: 0,
         bestSeconds: 0,
-        score: payout,
+        score: totalPayout,
         durationMs: 0,
       });
 
@@ -723,11 +860,13 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         roundEnded: true,
         safeClicks: newSafeClicks,
         currentMultiplier: newMultiplier,
-        payout,
+        payout: totalPayout,
+        jackpotWon,
         cashoutAvailable: false,
         provablyFair: {
           commitHash: closed.commit_hash,
           serverSeed: closed.server_seed,
+          nonce: Number(closed.nonce || 1),
           poisonIndices: closed.poison_indices,
         },
       });
@@ -758,6 +897,7 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
       finalDonutLive: newSafeClicks === 9,
       provablyFair: {
         commitHash: updated.commit_hash,
+        nonce: Number(updated.nonce || 1),
       },
     });
   } catch (e: any) {
@@ -833,6 +973,7 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
       currentMultiplier,
       payout,
       result: "cashout",
+      jackpotWon: 0,
     });
 
     lockAcquired = false;
@@ -840,6 +981,8 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
     if (!closed) {
       return res.status(409).json({ error: "Cashout close failed" });
     }
+
+    await creditBalance({ address, amount: payout });
 
     await logSession({
       address,
@@ -858,9 +1001,11 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
       safeClicks,
       currentMultiplier,
       payout,
+      jackpotWon: 0,
       provablyFair: {
         commitHash: closed.commit_hash,
         serverSeed: closed.server_seed,
+        nonce: Number(closed.nonce || 1),
         poisonIndices: closed.poison_indices,
       },
     });
@@ -903,6 +1048,7 @@ app.get("/greed/active", requireAuth, async (req: Request, res: Response) => {
         cashoutAvailable: Number(round.safe_clicks || 0) >= 1,
         provablyFair: {
           commitHash: round.commit_hash,
+          nonce: Number(round.nonce || 1),
         },
       },
     });
@@ -953,6 +1099,9 @@ app.get("/greed/feed", async (req: Request, res: Response) => {
   }
 });
 
+// -------------------------------
+// Standard leaderboards
+// -------------------------------
 app.get("/leaderboard", async (_req: Request, res: Response) => {
   const top = await getLeaderboard(30);
   res.json(
@@ -1010,9 +1159,63 @@ app.get("/leaderboard/games", async (req: Request, res: Response) => {
   }
 });
 
+// -------------------------------
+// Admin
+// -------------------------------
+app.post("/admin/deposit-credit", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const address = String(req.body?.address || "").trim();
+    const txSignature = String(req.body?.txSignature || "").trim();
+    const senderWallet = String(req.body?.senderWallet || "").trim() || null;
+    const tokenMint = String(req.body?.tokenMint || "").trim() || null;
+    const amount = Math.floor(Number(req.body?.amount || 0));
+    const note = String(req.body?.note || "manual admin credit").trim();
+
+    if (!address) return res.status(400).json({ error: "Missing address" });
+    if (!txSignature) return res.status(400).json({ error: "Missing txSignature" });
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+
+    const exists = await hasDepositTxSignature(txSignature);
+    if (exists) return res.status(400).json({ error: "Transaction already processed" });
+
+    const dep = await recordDeposit({
+      address,
+      txSignature,
+      senderWallet,
+      tokenMint,
+      amount,
+      status: "credited",
+      note,
+    });
+
+    if (!dep) return res.status(400).json({ error: "Transaction already processed" });
+
+    await creditBalance({ address, amount });
+
+    return res.json({ ok: true, deposit: dep });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Deposit credit failed" });
+  }
+});
+
+app.post("/admin/jackpot/reseed", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const amount = Math.max(0, Math.floor(Number(req.body?.amount || GREED_JACKPOT_RESEED)));
+    const row = await setGreedJackpotAmount(amount);
+    return res.json({ ok: true, jackpot: row });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Jackpot reseed failed" });
+  }
+});
+
 app.get("/admin/launch-reset", async (req: Request, res: Response) => {
-  const secret = req.query.secret;
-  if (secret !== "launch2026") return res.status(403).send("Unauthorized");
+  if (!requireAdmin(req, res)) return;
 
   try {
     await pool.query(`
@@ -1026,6 +1229,10 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
     await pool.query(`TRUNCATE TABLE sessions CASCADE;`);
     await pool.query(`TRUNCATE TABLE greed_picks CASCADE;`);
     await pool.query(`TRUNCATE TABLE greed_rounds CASCADE;`);
+    await pool.query(`TRUNCATE TABLE deposits CASCADE;`);
+    await pool.query(`TRUNCATE TABLE withdrawals CASCADE;`);
+    await pool.query(`UPDATE balances SET available_balance = 0, locked_balance = 0, updated_at = NOW();`);
+    await pool.query(`UPDATE jackpot_state SET current_amount = reseed_amount, updated_at = NOW() WHERE key = 'greed';`);
 
     try {
       await pool.query(`UPDATE pf_users SET total_calories = 0;`);
