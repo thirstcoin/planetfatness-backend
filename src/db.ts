@@ -9,7 +9,9 @@ if (!DATABASE_URL) {
 
 export const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes("localhost") ? undefined : { rejectUnauthorized: false },
+  ssl: process.env.DATABASE_URL?.includes("localhost")
+    ? undefined
+    : { rejectUnauthorized: false },
 });
 
 // -------------------------------
@@ -42,13 +44,13 @@ export async function initDb() {
     ADD COLUMN IF NOT EXISTS tg_last_name TEXT;
   `);
 
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_username ON users(tg_username);`);
-
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS lifetime_makes BIGINT NOT NULL DEFAULT 0;
   `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_tg_username ON users(tg_username);`);
 
   // Sessions table
   await pool.query(`
@@ -61,6 +63,7 @@ export async function initDb() {
       best_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
       score INT NOT NULL DEFAULT 0,
       duration_ms INT NOT NULL DEFAULT 0,
+      streak INT NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
@@ -83,12 +86,14 @@ export async function initDb() {
       poison_indices INTEGER[] NOT NULL,
       server_seed TEXT NOT NULL,
       commit_hash TEXT NOT NULL,
+      nonce BIGINT NOT NULL DEFAULT 1,
       status TEXT NOT NULL DEFAULT 'active',
       result TEXT,
       safe_clicks INT NOT NULL DEFAULT 0,
       current_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
       payout BIGINT NOT NULL DEFAULT 0,
       payout_status TEXT NOT NULL DEFAULT 'unpaid',
+      jackpot_won BIGINT NOT NULL DEFAULT 0,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       is_processing BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -103,16 +108,14 @@ export async function initDb() {
     ADD COLUMN IF NOT EXISTS result TEXT,
     ADD COLUMN IF NOT EXISTS current_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     ADD COLUMN IF NOT EXISTS payout_status TEXT NOT NULL DEFAULT 'unpaid',
+    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE,
     ADD COLUMN IF NOT EXISTS is_processing BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS revealed_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS commit_hash TEXT NOT NULL DEFAULT '';
-  `);
-
-  await pool.query(`
-    ALTER TABLE greed_rounds
-    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+    ADD COLUMN IF NOT EXISTS commit_hash TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS nonce BIGINT NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS jackpot_won BIGINT NOT NULL DEFAULT 0;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_address ON greed_rounds(address);`);
@@ -132,7 +135,71 @@ export async function initDb() {
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_picks_round ON greed_picks(round_id, created_at ASC);`);
 
-  console.log("✅ DB ready (TG + games + hardened Greed + provably fair + action locks)");
+  // Internal balances
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS balances (
+      address TEXT PRIMARY KEY REFERENCES users(address) ON DELETE CASCADE,
+      available_balance BIGINT NOT NULL DEFAULT 0,
+      locked_balance BIGINT NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // Deposits
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS deposits (
+      id BIGSERIAL PRIMARY KEY,
+      address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
+      tx_signature TEXT NOT NULL UNIQUE,
+      sender_wallet TEXT,
+      token_mint TEXT,
+      amount BIGINT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'credited',
+      note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_deposits_address_created ON deposits(address, created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_deposits_status_created ON deposits(status, created_at DESC);`);
+
+  // Withdrawals
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id BIGSERIAL PRIMARY KEY,
+      address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
+      destination_wallet TEXT NOT NULL,
+      amount BIGINT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      tx_signature TEXT,
+      note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_withdrawals_address_created ON withdrawals(address, created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_withdrawals_status_created ON withdrawals(status, created_at DESC);`);
+
+  // Jackpot state
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS jackpot_state (
+      key TEXT PRIMARY KEY,
+      current_amount BIGINT NOT NULL DEFAULT 5000,
+      reseed_amount BIGINT NOT NULL DEFAULT 5000,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    INSERT INTO jackpot_state (key, current_amount, reseed_amount)
+    VALUES ('greed', 5000, 5000)
+    ON CONFLICT (key) DO NOTHING;
+  `);
+
+  console.log("✅ DB ready (TG + games + Greed + balances + deposits + withdrawals + jackpot)");
 }
 
 // -------------------------------
@@ -149,6 +216,15 @@ export async function upsertUser(address: string) {
     ON CONFLICT (address) DO UPDATE
       SET updated_at = NOW()
     RETURNING *;
+    `,
+    [a]
+  );
+
+  await pool.query(
+    `
+    INSERT INTO balances (address)
+    VALUES ($1)
+    ON CONFLICT (address) DO NOTHING;
     `,
     [a]
   );
@@ -341,7 +417,7 @@ export async function getLeaderboardV2(params: {
   if (window === "month") whereTime = `AND s.created_at >= date_trunc('month', NOW())`;
 
   const whereGame = game ? `AND s.game = $2` : "";
-  const args: any[] = [limit];
+  const args: Array<string | number> = [limit];
   if (game) args.push(game);
 
   if (window === "lifetime" && (metric === "calories" || metric === "miles")) {
@@ -533,6 +609,253 @@ export async function getActivitySummary(params: { address: string }) {
 }
 
 // -------------------------------
+// Balance helpers
+// -------------------------------
+export async function getBalance(address: string) {
+  const a = String(address || "").trim();
+  if (!a) throw new Error("missing address");
+
+  await upsertUser(a);
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM balances
+    WHERE address = $1
+    LIMIT 1;
+    `,
+    [a]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function creditBalance(params: {
+  address: string;
+  amount: number;
+}) {
+  const address = String(params.address || "").trim();
+  const amount = Math.max(0, Math.floor(Number(params.amount || 0)));
+  if (!address) throw new Error("missing address");
+  if (amount <= 0) throw new Error("invalid amount");
+
+  await upsertUser(address);
+
+  const r = await pool.query(
+    `
+    UPDATE balances
+    SET
+      available_balance = available_balance + $2,
+      updated_at = NOW()
+    WHERE address = $1
+    RETURNING *;
+    `,
+    [address, amount]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function debitBalance(params: {
+  address: string;
+  amount: number;
+}) {
+  const address = String(params.address || "").trim();
+  const amount = Math.max(0, Math.floor(Number(params.amount || 0)));
+  if (!address) throw new Error("missing address");
+  if (amount <= 0) throw new Error("invalid amount");
+
+  await upsertUser(address);
+
+  const r = await pool.query(
+    `
+    UPDATE balances
+    SET
+      available_balance = available_balance - $2,
+      updated_at = NOW()
+    WHERE address = $1
+      AND available_balance >= $2
+    RETURNING *;
+    `,
+    [address, amount]
+  );
+
+  return r.rows[0] || null;
+}
+
+// -------------------------------
+// Deposit helpers
+// -------------------------------
+export async function hasDepositTxSignature(txSignature: string) {
+  const sig = String(txSignature || "").trim();
+  if (!sig) return false;
+
+  const r = await pool.query(
+    `
+    SELECT 1
+    FROM deposits
+    WHERE tx_signature = $1
+    LIMIT 1;
+    `,
+    [sig]
+  );
+
+  return r.rowCount > 0;
+}
+
+export async function recordDeposit(params: {
+  address: string;
+  txSignature: string;
+  senderWallet?: string | null;
+  tokenMint?: string | null;
+  amount: number;
+  status?: string;
+  note?: string | null;
+}) {
+  const address = String(params.address || "").trim();
+  const txSignature = String(params.txSignature || "").trim();
+  const senderWallet = params.senderWallet ? String(params.senderWallet).trim() : null;
+  const tokenMint = params.tokenMint ? String(params.tokenMint).trim() : null;
+  const amount = Math.max(0, Math.floor(Number(params.amount || 0)));
+  const status = String(params.status || "credited").trim();
+  const note = params.note ? String(params.note).trim() : null;
+
+  if (!address) throw new Error("missing address");
+  if (!txSignature) throw new Error("missing txSignature");
+  if (amount <= 0) throw new Error("invalid amount");
+
+  await upsertUser(address);
+
+  const r = await pool.query(
+    `
+    INSERT INTO deposits (
+      address,
+      tx_signature,
+      sender_wallet,
+      token_mint,
+      amount,
+      status,
+      note,
+      created_at,
+      updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),NOW())
+    ON CONFLICT (tx_signature) DO NOTHING
+    RETURNING *;
+    `,
+    [address, txSignature, senderWallet, tokenMint, amount, status, note]
+  );
+
+  return r.rows[0] || null;
+}
+
+// -------------------------------
+// Withdrawal helpers
+// -------------------------------
+export async function createWithdrawal(params: {
+  address: string;
+  destinationWallet: string;
+  amount: number;
+  note?: string | null;
+}) {
+  const address = String(params.address || "").trim();
+  const destinationWallet = String(params.destinationWallet || "").trim();
+  const amount = Math.max(0, Math.floor(Number(params.amount || 0)));
+  const note = params.note ? String(params.note).trim() : null;
+
+  if (!address) throw new Error("missing address");
+  if (!destinationWallet) throw new Error("missing destinationWallet");
+  if (amount <= 0) throw new Error("invalid amount");
+
+  await upsertUser(address);
+
+  const r = await pool.query(
+    `
+    INSERT INTO withdrawals (
+      address,
+      destination_wallet,
+      amount,
+      status,
+      note,
+      created_at,
+      updated_at
+    )
+    VALUES ($1,$2,$3,'pending',$4,NOW(),NOW())
+    RETURNING *;
+    `,
+    [address, destinationWallet, amount, note]
+  );
+
+  return r.rows[0] || null;
+}
+
+// -------------------------------
+// Jackpot helpers
+// -------------------------------
+export async function getGreedJackpotState() {
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM jackpot_state
+    WHERE key = 'greed'
+    LIMIT 1;
+    `
+  );
+  return r.rows[0] || null;
+}
+
+export async function setGreedJackpotAmount(amount: number) {
+  const nextAmount = Math.max(0, Math.floor(Number(amount || 0)));
+
+  const r = await pool.query(
+    `
+    UPDATE jackpot_state
+    SET
+      current_amount = $1,
+      updated_at = NOW()
+    WHERE key = 'greed'
+    RETURNING *;
+    `,
+    [nextAmount]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function addToGreedJackpot(amount: number) {
+  const addAmount = Math.max(0, Math.floor(Number(amount || 0)));
+
+  const r = await pool.query(
+    `
+    UPDATE jackpot_state
+    SET
+      current_amount = current_amount + $1,
+      updated_at = NOW()
+    WHERE key = 'greed'
+    RETURNING *;
+    `,
+    [addAmount]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function reseedGreedJackpot() {
+  const r = await pool.query(
+    `
+    UPDATE jackpot_state
+    SET
+      current_amount = reseed_amount,
+      updated_at = NOW()
+    WHERE key = 'greed'
+    RETURNING *;
+    `
+  );
+
+  return r.rows[0] || null;
+}
+
+// -------------------------------
 // Greed logic
 // -------------------------------
 export async function createGreedRound(params: {
@@ -542,8 +865,11 @@ export async function createGreedRound(params: {
   poisonIndices: number[];
   seed: string;
   commitHash: string;
+  nonce?: number;
 }) {
   await upsertUser(params.address);
+
+  const nonce = Math.max(1, Math.floor(Number(params.nonce || 1)));
 
   const r = await pool.query(
     `
@@ -554,18 +880,20 @@ export async function createGreedRound(params: {
       poison_indices,
       server_seed,
       commit_hash,
+      nonce,
       status,
       result,
       safe_clicks,
       current_multiplier,
       payout,
       payout_status,
+      jackpot_won,
       is_active,
       is_processing,
       created_at,
       updated_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, 'active', NULL, 0, 1.0, 0, 'unpaid', TRUE, FALSE, NOW(), NOW())
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', NULL, 0, 1.0, 0, 'unpaid', 0, TRUE, FALSE, NOW(), NOW())
     RETURNING *;
     `,
     [
@@ -575,6 +903,7 @@ export async function createGreedRound(params: {
       params.poisonIndices,
       params.seed,
       params.commitHash,
+      nonce,
     ]
   );
 
@@ -586,9 +915,11 @@ export async function getActiveGreedRound(address: string) {
     `
     SELECT *
     FROM greed_rounds
-    WHERE address = $1 AND status = 'active' AND is_active = TRUE
+    WHERE address = $1
+      AND status = 'active'
+      AND is_active = TRUE
     ORDER BY created_at DESC
-    LIMIT $1;
+    LIMIT 1;
     `,
     [address]
   );
@@ -600,7 +931,8 @@ export async function getGreedRoundByIdForAddress(roundId: number, address: stri
     `
     SELECT *
     FROM greed_rounds
-    WHERE id = $1 AND address = $2
+    WHERE id = $1
+      AND address = $2
     LIMIT 1;
     `,
     [roundId, address]
@@ -619,7 +951,7 @@ export async function getGreedPickedIndices(roundId: number): Promise<number[]> 
     [roundId]
   );
 
-  return (r.rows || []).map((x: any) => Number(x.donut_index));
+  return (r.rows || []).map((x: { donut_index: number }) => Number(x.donut_index));
 }
 
 export async function recordGreedPick(params: {
@@ -725,6 +1057,7 @@ export async function closeGreedRoundAsPoison(params: {
       result = 'poison',
       payout = 0,
       payout_status = 'unpaid',
+      jackpot_won = 0,
       is_active = FALSE,
       is_processing = FALSE,
       updated_at = NOW(),
@@ -749,7 +1082,10 @@ export async function closeGreedRoundAsCashout(params: {
   currentMultiplier: number;
   payout: number;
   result: "cashout" | "perfect";
+  jackpotWon?: number;
 }) {
+  const jackpotWon = Math.max(0, Math.floor(Number(params.jackpotWon || 0)));
+
   const r = await pool.query(
     `
     UPDATE greed_rounds
@@ -760,6 +1096,7 @@ export async function closeGreedRoundAsCashout(params: {
       result = $5,
       payout = $6,
       payout_status = 'recorded',
+      jackpot_won = $7,
       is_active = FALSE,
       is_processing = FALSE,
       updated_at = NOW(),
@@ -772,7 +1109,15 @@ export async function closeGreedRoundAsCashout(params: {
       AND payout_status = 'unpaid'
     RETURNING *;
     `,
-    [params.roundId, params.address, params.safeClicks, params.currentMultiplier, params.result, Math.floor(params.payout)]
+    [
+      params.roundId,
+      params.address,
+      params.safeClicks,
+      params.currentMultiplier,
+      params.result,
+      Math.floor(params.payout),
+      jackpotWon,
+    ]
   );
 
   return r.rows[0] || null;
@@ -797,6 +1142,7 @@ export async function getGreedLeaderboard(params: {
   const whereTime = greedWindowClause(params.window);
 
   let sql = "";
+
   if (params.board === "most_wagered") {
     sql = `
       SELECT
@@ -886,11 +1232,13 @@ export async function getGreedFeed(limit = 20) {
       u.display_name,
       gr.wager,
       gr.payout,
+      gr.jackpot_won,
       gr.safe_clicks,
       gr.current_multiplier,
       gr.result,
       gr.commit_hash,
       gr.server_seed,
+      gr.nonce,
       gr.poison_indices,
       gr.created_at,
       gr.ended_at,
