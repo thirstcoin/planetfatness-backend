@@ -1,3 +1,4 @@
+// PART 1 OF 4
 import pg from "pg";
 
 const { Pool } = pg;
@@ -183,6 +184,52 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_withdrawals_address_created ON withdrawals(address, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_withdrawals_status_created ON withdrawals(status, created_at DESC);`);
 
+  // Greed deposit intents
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS greed_deposit_intents (
+      id BIGSERIAL PRIMARY KEY,
+      address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
+      requested_wager BIGINT NOT NULL,
+      exact_amount BIGINT NOT NULL,
+      deposit_wallet TEXT NOT NULL,
+      sender_wallet TEXT,
+      token_mint TEXT,
+      tx_signature TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      expires_at TIMESTAMPTZ NOT NULL,
+      funded_at TIMESTAMPTZ,
+      started_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE greed_deposit_intents
+    ADD COLUMN IF NOT EXISTS requested_wager BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS exact_amount BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS deposit_wallet TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS sender_wallet TEXT,
+    ADD COLUMN IF NOT EXISTS token_mint TEXT,
+    ADD COLUMN IF NOT EXISTS tx_signature TEXT,
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending',
+    ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '10 minutes'),
+    ADD COLUMN IF NOT EXISTS funded_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_intents_address_created ON greed_deposit_intents(address, created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_intents_status_created ON greed_deposit_intents(status, created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_intents_expires ON greed_deposit_intents(expires_at);`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_greed_intents_tx_signature_unique ON greed_deposit_intents(tx_signature) WHERE tx_signature IS NOT NULL;`);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_greed_intents_one_open_per_user
+    ON greed_deposit_intents(address)
+    WHERE status IN ('pending', 'funded');
+  `);
+
   // Jackpot state
   await pool.query(`
     CREATE TABLE IF NOT EXISTS jackpot_state (
@@ -199,7 +246,7 @@ export async function initDb() {
     ON CONFLICT (key) DO NOTHING;
   `);
 
-  console.log("✅ DB ready (TG + games + Greed + balances + deposits + withdrawals + jackpot)");
+  console.log("✅ DB ready (TG + games + Greed + balances + deposits + withdrawals + deposit intents + jackpot)");
 }
 
 // -------------------------------
@@ -396,6 +443,7 @@ export async function logSession(params: {
 
   return r.rows[0] || null;
 }
+// PART 2 OF 4
 
 // -------------------------------
 // Leaderboard V2
@@ -750,6 +798,250 @@ export async function recordDeposit(params: {
 }
 
 // -------------------------------
+// Greed deposit intent helpers
+// -------------------------------
+export async function expireStaleGreedDepositIntents(address?: string) {
+  const hasAddress = !!String(address || "").trim();
+
+  const r = await pool.query(
+    `
+    UPDATE greed_deposit_intents
+    SET
+      status = 'expired',
+      updated_at = NOW()
+    WHERE status = 'pending'
+      AND expires_at <= NOW()
+      ${hasAddress ? "AND address = $1" : ""}
+    RETURNING *;
+    `,
+    hasAddress ? [String(address).trim()] : []
+  );
+
+  return r.rows || [];
+}
+
+export async function getOpenGreedDepositIntentByAddress(address: string) {
+  const a = String(address || "").trim();
+  if (!a) throw new Error("missing address");
+
+  await expireStaleGreedDepositIntents(a);
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM greed_deposit_intents
+    WHERE address = $1
+      AND status IN ('pending', 'funded')
+    ORDER BY created_at DESC
+    LIMIT 1;
+    `,
+    [a]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function getGreedDepositIntentByIdForAddress(id: number, address: string) {
+  const a = String(address || "").trim();
+  const intentId = Math.max(0, Math.floor(Number(id || 0)));
+  if (!a) throw new Error("missing address");
+  if (!intentId) throw new Error("missing id");
+
+  await expireStaleGreedDepositIntents(a);
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM greed_deposit_intents
+    WHERE id = $1
+      AND address = $2
+    LIMIT 1;
+    `,
+    [intentId, a]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function createGreedDepositIntent(params: {
+  address: string;
+  requestedWager: number;
+  exactAmount: number;
+  depositWallet: string;
+  tokenMint?: string | null;
+  expiresInMinutes?: number;
+}) {
+  const address = String(params.address || "").trim();
+  const requestedWager = Math.max(0, Math.floor(Number(params.requestedWager || 0)));
+  const exactAmount = Math.max(0, Math.floor(Number(params.exactAmount || 0)));
+  const depositWallet = String(params.depositWallet || "").trim();
+  const tokenMint = params.tokenMint ? String(params.tokenMint).trim() : null;
+  const expiresInMinutes = Math.max(1, Math.min(60, Math.floor(Number(params.expiresInMinutes || 10))));
+
+  if (!address) throw new Error("missing address");
+  if (requestedWager <= 0) throw new Error("invalid requestedWager");
+  if (exactAmount <= 0) throw new Error("invalid exactAmount");
+  if (!depositWallet) throw new Error("missing depositWallet");
+
+  await upsertUser(address);
+  await expireStaleGreedDepositIntents(address);
+
+  const existing = await getOpenGreedDepositIntentByAddress(address);
+  if (existing) return existing;
+
+  const r = await pool.query(
+    `
+    INSERT INTO greed_deposit_intents (
+      address,
+      requested_wager,
+      exact_amount,
+      deposit_wallet,
+      token_mint,
+      status,
+      expires_at,
+      created_at,
+      updated_at
+    )
+    VALUES (
+      $1,
+      $2,
+      $3,
+      $4,
+      $5,
+      'pending',
+      NOW() + ($6::TEXT || ' minutes')::INTERVAL,
+      NOW(),
+      NOW()
+    )
+    RETURNING *;
+    `,
+    [address, requestedWager, exactAmount, depositWallet, tokenMint, expiresInMinutes]
+  );
+
+  return r.rows[0] || null;
+}
+// PART 3 OF 4
+
+export async function cancelGreedDepositIntent(params: {
+  id: number;
+  address: string;
+}) {
+  const id = Math.max(0, Math.floor(Number(params.id || 0)));
+  const address = String(params.address || "").trim();
+  if (!id) throw new Error("missing id");
+  if (!address) throw new Error("missing address");
+
+  const r = await pool.query(
+    `
+    UPDATE greed_deposit_intents
+    SET
+      status = CASE
+        WHEN status IN ('pending', 'funded') THEN 'cancelled'
+        ELSE status
+      END,
+      updated_at = NOW()
+    WHERE id = $1
+      AND address = $2
+    RETURNING *;
+    `,
+    [id, address]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function markGreedDepositIntentFunded(params: {
+  id: number;
+  address: string;
+  txSignature: string;
+  senderWallet?: string | null;
+  tokenMint?: string | null;
+}) {
+  const id = Math.max(0, Math.floor(Number(params.id || 0)));
+  const address = String(params.address || "").trim();
+  const txSignature = String(params.txSignature || "").trim();
+  const senderWallet = params.senderWallet ? String(params.senderWallet).trim() : null;
+  const tokenMint = params.tokenMint ? String(params.tokenMint).trim() : null;
+
+  if (!id) throw new Error("missing id");
+  if (!address) throw new Error("missing address");
+  if (!txSignature) throw new Error("missing txSignature");
+
+  const r = await pool.query(
+    `
+    UPDATE greed_deposit_intents
+    SET
+      status = 'funded',
+      tx_signature = $3,
+      sender_wallet = COALESCE($4, sender_wallet),
+      token_mint = COALESCE($5, token_mint),
+      funded_at = NOW(),
+      updated_at = NOW()
+    WHERE id = $1
+      AND address = $2
+      AND status = 'pending'
+      AND expires_at > NOW()
+    RETURNING *;
+    `,
+    [id, address, txSignature, senderWallet, tokenMint]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function findGreedDepositIntentByExactAmount(params: {
+  exactAmount: number;
+  status?: "pending" | "funded";
+}) {
+  const exactAmount = Math.max(0, Math.floor(Number(params.exactAmount || 0)));
+  const status = String(params.status || "pending").trim();
+
+  if (exactAmount <= 0) throw new Error("invalid exactAmount");
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM greed_deposit_intents
+    WHERE exact_amount = $1
+      AND status = $2
+      AND expires_at > NOW()
+    ORDER BY created_at ASC
+    LIMIT 1;
+    `,
+    [exactAmount, status]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function consumeFundedGreedDepositIntent(params: {
+  id: number;
+  address: string;
+}) {
+  const id = Math.max(0, Math.floor(Number(params.id || 0)));
+  const address = String(params.address || "").trim();
+  if (!id) throw new Error("missing id");
+  if (!address) throw new Error("missing address");
+
+  const r = await pool.query(
+    `
+    UPDATE greed_deposit_intents
+    SET
+      status = 'consumed',
+      started_at = NOW(),
+      updated_at = NOW()
+    WHERE id = $1
+      AND address = $2
+      AND status = 'funded'
+    RETURNING *;
+    `,
+    [id, address]
+  );
+
+  return r.rows[0] || null;
+}
+
+// -------------------------------
 // Withdrawal helpers
 // -------------------------------
 export async function createWithdrawal(params: {
@@ -1040,6 +1332,7 @@ export async function updateGreedRoundProgress(params: {
 
   return r.rows[0] || null;
 }
+// PART 4 OF 4
 
 export async function closeGreedRoundAsPoison(params: {
   roundId: number;
