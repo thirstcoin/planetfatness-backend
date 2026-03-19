@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import type { Request, Response } from "express";
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 
@@ -63,6 +63,8 @@ const PORT = Number(process.env.PORT || 10000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 const TG_GAME_SHORT_NAME = String(process.env.TG_GAME_SHORT_NAME || "planetfatness").trim();
 const ADMIN_SECRET = String(process.env.ADMIN_SECRET || "launch2026").trim();
+const GREED_WEBAPP_URL = String(process.env.GREED_WEBAPP_URL || "https://planetfatness.fit/greed").trim();
+const HUB_WEBAPP_URL = String(process.env.HUB_WEBAPP_URL || "https://planetfatness.fit/").trim();
 
 app.use(express.json({ limit: "1mb" }));
 app.use(
@@ -335,7 +337,6 @@ app.get("/health", (_req: Request, res: Response) =>
 );
 
 app.use("/auth", authRouter);
-
 // -------------------------------
 // Wallet / balance
 // -------------------------------
@@ -383,7 +384,11 @@ app.post("/wallet/withdraw", requireAuth, async (req: Request, res: Response) =>
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    await debitBalance({ address, amount });
+    const debited = await debitBalance({ address, amount });
+    if (!debited) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
     const row = await createWithdrawal({
       address,
       destinationWallet,
@@ -721,7 +726,6 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
     return res.status(500).json({ error: "Failed to start greed round" });
   }
 });
-
 app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
   let lockAcquired = false;
 
@@ -1158,7 +1162,6 @@ app.get("/leaderboard/games", async (req: Request, res: Response) => {
     res.status(500).json({ error: "Leaderboard games failed" });
   }
 });
-
 // -------------------------------
 // Admin
 // -------------------------------
@@ -1250,7 +1253,34 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
 const bot = new Telegraf(process.env.GREED_BOT_TOKEN || "");
 
 bot.command("game", async (ctx) => {
-  await ctx.replyWithGame(TG_GAME_SHORT_NAME);
+  try {
+    await ctx.reply(
+      "🍩 Feed Your Greed is live.\nTap below to open the official game.",
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]
+      ])
+    );
+  } catch (e) {
+    console.error("GREED /game button error:", e);
+    try {
+      await ctx.replyWithGame(TG_GAME_SHORT_NAME);
+    } catch (inner) {
+      console.error("GREED fallback replyWithGame error:", inner);
+    }
+  }
+});
+
+bot.start(async (ctx) => {
+  try {
+    await ctx.reply(
+      "🍩 Feed Your Greed is live.\nTap below to open the official game.",
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]
+      ])
+    );
+  } catch (e) {
+    console.error("GREED /start button error:", e);
+  }
 });
 
 bot.on("callback_query", async (ctx) => {
@@ -1265,7 +1295,7 @@ bot.on("callback_query", async (ctx) => {
     const lastName = user?.last_name ? String(user.last_name) : "";
 
     if (!tgIdNum) {
-      await ctx.answerGameQuery("https://planetfatness.fit/");
+      await ctx.answerGameQuery(GREED_WEBAPP_URL);
       return;
     }
 
@@ -1293,7 +1323,7 @@ bot.on("callback_query", async (ctx) => {
       }
     } catch (e) {
       console.error("TG game upsert/identity failed:", e);
-      await ctx.answerGameQuery("https://planetfatness.fit/");
+      await ctx.answerGameQuery(GREED_WEBAPP_URL);
       return;
     }
 
@@ -1302,16 +1332,16 @@ bot.on("callback_query", async (ctx) => {
       token = signTokenForAddress(address);
     } catch (e) {
       console.error("TG game signToken failed:", e);
-      await ctx.answerGameQuery("https://planetfatness.fit/");
+      await ctx.answerGameQuery(GREED_WEBAPP_URL);
       return;
     }
 
-    const launchUrl = `https://planetfatness.fit/greed?t=${encodeURIComponent(token)}`;
+    const launchUrl = `${GREED_WEBAPP_URL}?t=${encodeURIComponent(token)}`;
     await ctx.answerGameQuery(launchUrl);
   } catch (e) {
     console.error("TG game callback handler error:", e);
     try {
-      await ctx.answerGameQuery("https://planetfatness.fit/");
+      await ctx.answerGameQuery(GREED_WEBAPP_URL);
     } catch {}
   }
 });
@@ -1319,17 +1349,54 @@ bot.on("callback_query", async (ctx) => {
 // Main gym bot
 const gymBot = new Telegraf(process.env.TG_BOT_TOKEN || "");
 
-gymBot.start((ctx) => {
-  ctx.reply("🏋️ Welcome back to Planet Fatness Gym! Use the button below to start your workout.");
+gymBot.start(async (ctx) => {
+  try {
+    await ctx.reply(
+      "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app.",
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]
+      ])
+    );
+  } catch (e) {
+    console.error("GYM /start button error:", e);
+    try {
+      await ctx.reply("🏋️ Welcome back to Planet Fatness Gym!");
+    } catch {}
+  }
+});
+
+gymBot.command("greed", async (ctx) => {
+  try {
+    await ctx.reply(
+      "🍩 Feed Your Greed is live.\nTap below to open the official game.",
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]
+      ])
+    );
+  } catch (e) {
+    console.error("GYM /greed button error:", e);
+  }
 });
 
 gymBot.on("callback_query", async (ctx) => {
   try {
-    const address = `tg:${ctx.from.id}`;
-    const token = signTokenForAddress(address);
-    await ctx.answerGameQuery(`https://planetfatness.fit/?t=${encodeURIComponent(token)}`);
+    const q = ctx.callbackQuery;
+    if (q && "game_short_name" in q) {
+      const address = `tg:${ctx.from.id}`;
+      const token = signTokenForAddress(address);
+      await ctx.answerGameQuery(`${HUB_WEBAPP_URL}?t=${encodeURIComponent(token)}`);
+      return;
+    }
+
+    try {
+      await ctx.answerCbQuery();
+    } catch {}
   } catch (e) {
-    await ctx.answerGameQuery("https://planetfatness.fit/");
+    console.error("GYM callback handler error:", e);
+    try {
+      await ctx.answerCbQuery();
+    } catch {}
   }
 });
 
