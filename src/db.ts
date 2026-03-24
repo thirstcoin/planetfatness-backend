@@ -1,4 +1,3 @@
-// PART 1 OF 4
 import pg from "pg";
 
 const { Pool } = pg;
@@ -14,6 +13,24 @@ export const pool = new Pool({
     ? undefined
     : { rejectUnauthorized: false },
 });
+
+function asAmount(value: unknown): string {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n < 0) return "0.000";
+  return n.toFixed(3);
+}
+
+function asMaybeAmount(value: unknown): string | null {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n.toFixed(3);
+}
+
+function asInt(value: unknown): number {
+  const n = Math.floor(Number(value || 0));
+  return Number.isFinite(n) ? Math.max(0, n) : 0;
+}
 
 // -------------------------------
 // Schema bootstrap
@@ -82,8 +99,8 @@ export async function initDb() {
     CREATE TABLE IF NOT EXISTS greed_rounds (
       id BIGSERIAL PRIMARY KEY,
       address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
-      wager BIGINT NOT NULL,
-      net_stake BIGINT NOT NULL,
+      wager NUMERIC(18,3) NOT NULL DEFAULT 0,
+      net_stake NUMERIC(18,3) NOT NULL DEFAULT 0,
       poison_indices INTEGER[] NOT NULL,
       server_seed TEXT NOT NULL,
       commit_hash TEXT NOT NULL,
@@ -92,9 +109,9 @@ export async function initDb() {
       result TEXT,
       safe_clicks INT NOT NULL DEFAULT 0,
       current_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
-      payout BIGINT NOT NULL DEFAULT 0,
+      payout NUMERIC(18,3) NOT NULL DEFAULT 0,
       payout_status TEXT NOT NULL DEFAULT 'unpaid',
-      jackpot_won BIGINT NOT NULL DEFAULT 0,
+      jackpot_won NUMERIC(18,3) NOT NULL DEFAULT 0,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       is_processing BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -116,7 +133,18 @@ export async function initDb() {
     ADD COLUMN IF NOT EXISTS revealed_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS commit_hash TEXT NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS nonce BIGINT NOT NULL DEFAULT 1,
-    ADD COLUMN IF NOT EXISTS jackpot_won BIGINT NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS jackpot_won NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS wager NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS net_stake NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS payout NUMERIC(18,3) NOT NULL DEFAULT 0;
+  `);
+
+  await pool.query(`
+    ALTER TABLE greed_rounds
+    ALTER COLUMN wager TYPE NUMERIC(18,3) USING (wager::numeric),
+    ALTER COLUMN net_stake TYPE NUMERIC(18,3) USING (net_stake::numeric),
+    ALTER COLUMN payout TYPE NUMERIC(18,3) USING (payout::numeric),
+    ALTER COLUMN jackpot_won TYPE NUMERIC(18,3) USING (jackpot_won::numeric);
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_address ON greed_rounds(address);`);
@@ -140,11 +168,17 @@ export async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS balances (
       address TEXT PRIMARY KEY REFERENCES users(address) ON DELETE CASCADE,
-      available_balance BIGINT NOT NULL DEFAULT 0,
-      locked_balance BIGINT NOT NULL DEFAULT 0,
+      available_balance NUMERIC(18,3) NOT NULL DEFAULT 0,
+      locked_balance NUMERIC(18,3) NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE balances
+    ALTER COLUMN available_balance TYPE NUMERIC(18,3) USING (available_balance::numeric),
+    ALTER COLUMN locked_balance TYPE NUMERIC(18,3) USING (locked_balance::numeric);
   `);
 
   // Deposits
@@ -155,12 +189,17 @@ export async function initDb() {
       tx_signature TEXT NOT NULL UNIQUE,
       sender_wallet TEXT,
       token_mint TEXT,
-      amount BIGINT NOT NULL,
+      amount NUMERIC(18,3) NOT NULL,
       status TEXT NOT NULL DEFAULT 'credited',
       note TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE deposits
+    ALTER COLUMN amount TYPE NUMERIC(18,3) USING (amount::numeric);
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_deposits_address_created ON deposits(address, created_at DESC);`);
@@ -172,13 +211,18 @@ export async function initDb() {
       id BIGSERIAL PRIMARY KEY,
       address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
       destination_wallet TEXT NOT NULL,
-      amount BIGINT NOT NULL,
+      amount NUMERIC(18,3) NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       tx_signature TEXT,
       note TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE withdrawals
+    ALTER COLUMN amount TYPE NUMERIC(18,3) USING (amount::numeric);
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_withdrawals_address_created ON withdrawals(address, created_at DESC);`);
@@ -189,8 +233,8 @@ export async function initDb() {
     CREATE TABLE IF NOT EXISTS greed_deposit_intents (
       id BIGSERIAL PRIMARY KEY,
       address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
-      requested_wager BIGINT NOT NULL,
-      exact_amount BIGINT NOT NULL,
+      requested_wager NUMERIC(18,3) NOT NULL,
+      exact_amount NUMERIC(18,3) NOT NULL,
       deposit_wallet TEXT NOT NULL,
       sender_wallet TEXT,
       token_mint TEXT,
@@ -206,8 +250,8 @@ export async function initDb() {
 
   await pool.query(`
     ALTER TABLE greed_deposit_intents
-    ADD COLUMN IF NOT EXISTS requested_wager BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS exact_amount BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS requested_wager NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS exact_amount NUMERIC(18,3) NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS deposit_wallet TEXT NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS sender_wallet TEXT,
     ADD COLUMN IF NOT EXISTS token_mint TEXT,
@@ -218,6 +262,12 @@ export async function initDb() {
     ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  `);
+
+  await pool.query(`
+    ALTER TABLE greed_deposit_intents
+    ALTER COLUMN requested_wager TYPE NUMERIC(18,3) USING (requested_wager::numeric),
+    ALTER COLUMN exact_amount TYPE NUMERIC(18,3) USING (exact_amount::numeric);
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_intents_address_created ON greed_deposit_intents(address, created_at DESC);`);
@@ -234,15 +284,21 @@ export async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS jackpot_state (
       key TEXT PRIMARY KEY,
-      current_amount BIGINT NOT NULL DEFAULT 5000,
-      reseed_amount BIGINT NOT NULL DEFAULT 5000,
+      current_amount NUMERIC(18,3) NOT NULL DEFAULT 5000,
+      reseed_amount NUMERIC(18,3) NOT NULL DEFAULT 5000,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
   await pool.query(`
+    ALTER TABLE jackpot_state
+    ALTER COLUMN current_amount TYPE NUMERIC(18,3) USING (current_amount::numeric),
+    ALTER COLUMN reseed_amount TYPE NUMERIC(18,3) USING (reseed_amount::numeric);
+  `);
+
+  await pool.query(`
     INSERT INTO jackpot_state (key, current_amount, reseed_amount)
-    VALUES ('greed', 5000, 5000)
+    VALUES ('greed', 5000.000, 5000.000)
     ON CONFLICT (key) DO NOTHING;
   `);
 
@@ -361,10 +417,10 @@ export async function addActivity(params: {
   addScore?: number;
 }) {
   const address = String(params.address || "").trim();
-  const addCalories = Math.max(0, Math.floor(Number(params.addCalories || 0)));
+  const addCalories = Math.max(0, asInt(params.addCalories));
   const addMiles = Math.max(0, Number(params.addMiles || 0));
   const bestSeconds = Math.max(0, Number(params.bestSeconds || 0));
-  const addScore = Math.max(0, Math.floor(Number(params.addScore || 0)));
+  const addScore = Math.max(0, asInt(params.addScore));
 
   if (!address) throw new Error("missing address");
 
@@ -421,12 +477,12 @@ export async function logSession(params: {
   const address = String(params.address || "").trim();
   const game = String(params.game || "unknown").trim().slice(0, 32);
 
-  const calories = Math.max(0, Math.floor(Number(params.calories || 0)));
+  const calories = Math.max(0, asInt(params.calories));
   const miles = Math.max(0, Number(params.miles || 0));
   const bestSeconds = Math.max(0, Number(params.bestSeconds || 0));
-  const score = Math.max(0, Math.floor(Number(params.score || 0)));
-  const durationMs = Math.max(0, Math.floor(Number(params.durationMs || 0)));
-  const streak = Math.max(0, Math.floor(Number(params.streak || 0)));
+  const score = Math.max(0, asInt(params.score));
+  const durationMs = Math.max(0, asInt(params.durationMs));
+  const streak = Math.max(0, asInt(params.streak));
 
   if (!address) throw new Error("missing address");
 
@@ -443,8 +499,6 @@ export async function logSession(params: {
 
   return r.rows[0] || null;
 }
-// PART 2 OF 4
-
 // -------------------------------
 // Leaderboard V2
 // -------------------------------
@@ -680,12 +734,13 @@ export async function getBalance(address: string) {
 
 export async function creditBalance(params: {
   address: string;
-  amount: number;
+  amount: number | string;
 }) {
   const address = String(params.address || "").trim();
-  const amount = Math.max(0, Math.floor(Number(params.amount || 0)));
+  const amount = asAmount(params.amount);
+
   if (!address) throw new Error("missing address");
-  if (amount <= 0) throw new Error("invalid amount");
+  if (Number(amount) <= 0) throw new Error("invalid amount");
 
   await upsertUser(address);
 
@@ -693,7 +748,7 @@ export async function creditBalance(params: {
     `
     UPDATE balances
     SET
-      available_balance = available_balance + $2,
+      available_balance = available_balance + $2::numeric,
       updated_at = NOW()
     WHERE address = $1
     RETURNING *;
@@ -706,12 +761,13 @@ export async function creditBalance(params: {
 
 export async function debitBalance(params: {
   address: string;
-  amount: number;
+  amount: number | string;
 }) {
   const address = String(params.address || "").trim();
-  const amount = Math.max(0, Math.floor(Number(params.amount || 0)));
+  const amount = asAmount(params.amount);
+
   if (!address) throw new Error("missing address");
-  if (amount <= 0) throw new Error("invalid amount");
+  if (Number(amount) <= 0) throw new Error("invalid amount");
 
   await upsertUser(address);
 
@@ -719,10 +775,10 @@ export async function debitBalance(params: {
     `
     UPDATE balances
     SET
-      available_balance = available_balance - $2,
+      available_balance = available_balance - $2::numeric,
       updated_at = NOW()
     WHERE address = $1
-      AND available_balance >= $2
+      AND available_balance >= $2::numeric
     RETURNING *;
     `,
     [address, amount]
@@ -756,7 +812,7 @@ export async function recordDeposit(params: {
   txSignature: string;
   senderWallet?: string | null;
   tokenMint?: string | null;
-  amount: number;
+  amount: number | string;
   status?: string;
   note?: string | null;
 }) {
@@ -764,13 +820,13 @@ export async function recordDeposit(params: {
   const txSignature = String(params.txSignature || "").trim();
   const senderWallet = params.senderWallet ? String(params.senderWallet).trim() : null;
   const tokenMint = params.tokenMint ? String(params.tokenMint).trim() : null;
-  const amount = Math.max(0, Math.floor(Number(params.amount || 0)));
+  const amount = asAmount(params.amount);
   const status = String(params.status || "credited").trim();
   const note = params.note ? String(params.note).trim() : null;
 
   if (!address) throw new Error("missing address");
   if (!txSignature) throw new Error("missing txSignature");
-  if (amount <= 0) throw new Error("invalid amount");
+  if (Number(amount) <= 0) throw new Error("invalid amount");
 
   await upsertUser(address);
 
@@ -787,7 +843,7 @@ export async function recordDeposit(params: {
       created_at,
       updated_at
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),NOW())
+    VALUES ($1,$2,$3,$4,$5::numeric,$6,$7,NOW(),NOW())
     ON CONFLICT (tx_signature) DO NOTHING
     RETURNING *;
     `,
@@ -844,6 +900,7 @@ export async function getOpenGreedDepositIntentByAddress(address: string) {
 export async function getGreedDepositIntentByIdForAddress(id: number, address: string) {
   const a = String(address || "").trim();
   const intentId = Math.max(0, Math.floor(Number(id || 0)));
+
   if (!a) throw new Error("missing address");
   if (!intentId) throw new Error("missing id");
 
@@ -865,22 +922,22 @@ export async function getGreedDepositIntentByIdForAddress(id: number, address: s
 
 export async function createGreedDepositIntent(params: {
   address: string;
-  requestedWager: number;
-  exactAmount: number;
+  requestedWager: number | string;
+  exactAmount: number | string;
   depositWallet: string;
   tokenMint?: string | null;
   expiresInMinutes?: number;
 }) {
   const address = String(params.address || "").trim();
-  const requestedWager = Math.max(0, Math.floor(Number(params.requestedWager || 0)));
-  const exactAmount = Math.max(0, Math.floor(Number(params.exactAmount || 0)));
+  const requestedWager = asAmount(params.requestedWager);
+  const exactAmount = asAmount(params.exactAmount);
   const depositWallet = String(params.depositWallet || "").trim();
   const tokenMint = params.tokenMint ? String(params.tokenMint).trim() : null;
   const expiresInMinutes = Math.max(1, Math.min(60, Math.floor(Number(params.expiresInMinutes || 10))));
 
   if (!address) throw new Error("missing address");
-  if (requestedWager <= 0) throw new Error("invalid requestedWager");
-  if (exactAmount <= 0) throw new Error("invalid exactAmount");
+  if (Number(requestedWager) <= 0) throw new Error("invalid requestedWager");
+  if (Number(exactAmount) <= 0) throw new Error("invalid exactAmount");
   if (!depositWallet) throw new Error("missing depositWallet");
 
   await upsertUser(address);
@@ -904,8 +961,8 @@ export async function createGreedDepositIntent(params: {
     )
     VALUES (
       $1,
-      $2,
-      $3,
+      $2::numeric,
+      $3::numeric,
       $4,
       $5,
       'pending',
@@ -920,14 +977,13 @@ export async function createGreedDepositIntent(params: {
 
   return r.rows[0] || null;
 }
-// PART 3 OF 4
-
 export async function cancelGreedDepositIntent(params: {
   id: number;
   address: string;
 }) {
   const id = Math.max(0, Math.floor(Number(params.id || 0)));
   const address = String(params.address || "").trim();
+
   if (!id) throw new Error("missing id");
   if (!address) throw new Error("missing address");
 
@@ -990,19 +1046,19 @@ export async function markGreedDepositIntentFunded(params: {
 }
 
 export async function findGreedDepositIntentByExactAmount(params: {
-  exactAmount: number;
+  exactAmount: number | string;
   status?: "pending" | "funded";
 }) {
-  const exactAmount = Math.max(0, Math.floor(Number(params.exactAmount || 0)));
+  const exactAmount = asAmount(params.exactAmount);
   const status = String(params.status || "pending").trim();
 
-  if (exactAmount <= 0) throw new Error("invalid exactAmount");
+  if (Number(exactAmount) <= 0) throw new Error("invalid exactAmount");
 
   const r = await pool.query(
     `
     SELECT *
     FROM greed_deposit_intents
-    WHERE exact_amount = $1
+    WHERE exact_amount = $1::numeric
       AND status = $2
       AND expires_at > NOW()
     ORDER BY created_at ASC
@@ -1020,6 +1076,7 @@ export async function consumeFundedGreedDepositIntent(params: {
 }) {
   const id = Math.max(0, Math.floor(Number(params.id || 0)));
   const address = String(params.address || "").trim();
+
   if (!id) throw new Error("missing id");
   if (!address) throw new Error("missing address");
 
@@ -1047,17 +1104,17 @@ export async function consumeFundedGreedDepositIntent(params: {
 export async function createWithdrawal(params: {
   address: string;
   destinationWallet: string;
-  amount: number;
+  amount: number | string;
   note?: string | null;
 }) {
   const address = String(params.address || "").trim();
   const destinationWallet = String(params.destinationWallet || "").trim();
-  const amount = Math.max(0, Math.floor(Number(params.amount || 0)));
+  const amount = asAmount(params.amount);
   const note = params.note ? String(params.note).trim() : null;
 
   if (!address) throw new Error("missing address");
   if (!destinationWallet) throw new Error("missing destinationWallet");
-  if (amount <= 0) throw new Error("invalid amount");
+  if (Number(amount) <= 0) throw new Error("invalid amount");
 
   await upsertUser(address);
 
@@ -1072,7 +1129,7 @@ export async function createWithdrawal(params: {
       created_at,
       updated_at
     )
-    VALUES ($1,$2,$3,'pending',$4,NOW(),NOW())
+    VALUES ($1,$2,$3::numeric,'pending',$4,NOW(),NOW())
     RETURNING *;
     `,
     [address, destinationWallet, amount, note]
@@ -1096,14 +1153,14 @@ export async function getGreedJackpotState() {
   return r.rows[0] || null;
 }
 
-export async function setGreedJackpotAmount(amount: number) {
-  const nextAmount = Math.max(0, Math.floor(Number(amount || 0)));
+export async function setGreedJackpotAmount(amount: number | string) {
+  const nextAmount = asAmount(amount);
 
   const r = await pool.query(
     `
     UPDATE jackpot_state
     SET
-      current_amount = $1,
+      current_amount = $1::numeric,
       updated_at = NOW()
     WHERE key = 'greed'
     RETURNING *;
@@ -1114,14 +1171,14 @@ export async function setGreedJackpotAmount(amount: number) {
   return r.rows[0] || null;
 }
 
-export async function addToGreedJackpot(amount: number) {
-  const addAmount = Math.max(0, Math.floor(Number(amount || 0)));
+export async function addToGreedJackpot(amount: number | string) {
+  const addAmount = asAmount(amount);
 
   const r = await pool.query(
     `
     UPDATE jackpot_state
     SET
-      current_amount = current_amount + $1,
+      current_amount = current_amount + $1::numeric,
       updated_at = NOW()
     WHERE key = 'greed'
     RETURNING *;
@@ -1152,8 +1209,8 @@ export async function reseedGreedJackpot() {
 // -------------------------------
 export async function createGreedRound(params: {
   address: string;
-  wager: number;
-  netStake: number;
+  wager: number | string;
+  netStake: number | string;
   poisonIndices: number[];
   seed: string;
   commitHash: string;
@@ -1162,6 +1219,8 @@ export async function createGreedRound(params: {
   await upsertUser(params.address);
 
   const nonce = Math.max(1, Math.floor(Number(params.nonce || 1)));
+  const wager = asAmount(params.wager);
+  const netStake = asAmount(params.netStake);
 
   const r = await pool.query(
     `
@@ -1185,13 +1244,13 @@ export async function createGreedRound(params: {
       created_at,
       updated_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', NULL, 0, 1.0, 0, 'unpaid', 0, TRUE, FALSE, NOW(), NOW())
+    VALUES ($1, $2::numeric, $3::numeric, $4, $5, $6, $7, 'active', NULL, 0, 1.0, 0, 'unpaid', 0, TRUE, FALSE, NOW(), NOW())
     RETURNING *;
     `,
     [
       params.address,
-      Math.floor(params.wager),
-      Math.floor(params.netStake),
+      wager,
+      netStake,
       params.poisonIndices,
       params.seed,
       params.commitHash,
@@ -1332,8 +1391,6 @@ export async function updateGreedRoundProgress(params: {
 
   return r.rows[0] || null;
 }
-// PART 4 OF 4
-
 export async function closeGreedRoundAsPoison(params: {
   roundId: number;
   address: string;
@@ -1373,11 +1430,12 @@ export async function closeGreedRoundAsCashout(params: {
   address: string;
   safeClicks: number;
   currentMultiplier: number;
-  payout: number;
+  payout: number | string;
   result: "cashout" | "perfect";
-  jackpotWon?: number;
+  jackpotWon?: number | string;
 }) {
-  const jackpotWon = Math.max(0, Math.floor(Number(params.jackpotWon || 0)));
+  const payout = asAmount(params.payout);
+  const jackpotWon = asAmount(params.jackpotWon || 0);
 
   const r = await pool.query(
     `
@@ -1387,9 +1445,9 @@ export async function closeGreedRoundAsCashout(params: {
       current_multiplier = $4,
       status = 'closed',
       result = $5,
-      payout = $6,
+      payout = $6::numeric,
       payout_status = 'recorded',
-      jackpot_won = $7,
+      jackpot_won = $7::numeric,
       is_active = FALSE,
       is_processing = FALSE,
       updated_at = NOW(),
@@ -1408,7 +1466,7 @@ export async function closeGreedRoundAsCashout(params: {
       params.safeClicks,
       params.currentMultiplier,
       params.result,
-      Math.floor(params.payout),
+      payout,
       jackpotWon,
     ]
   );
@@ -1441,7 +1499,7 @@ export async function getGreedLeaderboard(params: {
       SELECT
         gr.address,
         u.display_name,
-        SUM(gr.wager)::BIGINT AS value
+        SUM(gr.wager)::DOUBLE PRECISION AS value
       FROM greed_rounds gr
       LEFT JOIN users u ON u.address = gr.address
       WHERE gr.status = 'closed'
@@ -1455,7 +1513,7 @@ export async function getGreedLeaderboard(params: {
       SELECT
         gr.address,
         u.display_name,
-        (COALESCE(SUM(gr.payout),0) - COALESCE(SUM(gr.wager),0))::BIGINT AS value
+        (COALESCE(SUM(gr.payout),0) - COALESCE(SUM(gr.wager),0))::DOUBLE PRECISION AS value
       FROM greed_rounds gr
       LEFT JOIN users u ON u.address = gr.address
       WHERE gr.status = 'closed'
@@ -1484,7 +1542,7 @@ export async function getGreedLeaderboard(params: {
       SELECT
         gr.address,
         u.display_name,
-        MAX(gr.payout)::BIGINT AS value
+        MAX(gr.payout)::DOUBLE PRECISION AS value
       FROM greed_rounds gr
       LEFT JOIN users u ON u.address = gr.address
       WHERE gr.status = 'closed'
@@ -1499,7 +1557,7 @@ export async function getGreedLeaderboard(params: {
       SELECT
         gr.address,
         u.display_name,
-        (COALESCE(SUM(gr.wager),0) - COALESCE(SUM(gr.payout),0))::BIGINT AS value
+        (COALESCE(SUM(gr.wager),0) - COALESCE(SUM(gr.payout),0))::DOUBLE PRECISION AS value
       FROM greed_rounds gr
       LEFT JOIN users u ON u.address = gr.address
       WHERE gr.status = 'closed'
