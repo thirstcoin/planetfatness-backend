@@ -13,6 +13,9 @@ const express = expressMod.default;
 const corsMod = await import("cors");
 const cors = corsMod.default;
 
+const solanaWeb3Mod = await import("@solana/web3.js");
+const { Connection, PublicKey } = solanaWeb3Mod;
+
 const authMod = await import("./auth.js");
 const authRouter = authMod.default;
 const requireAuth = authMod.requireAuth as any;
@@ -81,6 +84,24 @@ const GREED_INTENT_EXPIRES_MINUTES = Math.max(
   Math.min(60, Number(process.env.GREED_INTENT_EXPIRES_MINUTES || 10))
 );
 
+// Solana watcher config
+const SOLANA_RPC_URL = String(
+  process.env.SOLANA_RPC_URL || process.env.RPC_URL || "https://api.mainnet-beta.solana.com"
+).trim();
+
+const SOLANA_WATCH_ENABLED =
+  String(process.env.SOLANA_WATCH_ENABLED || "true").trim().toLowerCase() !== "false";
+
+const SOLANA_WATCH_INTERVAL_MS = Math.max(
+  2500,
+  Math.min(20000, Number(process.env.SOLANA_WATCH_INTERVAL_MS || 4000))
+);
+
+const SOLANA_WATCH_SIGNATURE_LIMIT = Math.max(
+  5,
+  Math.min(50, Number(process.env.SOLANA_WATCH_SIGNATURE_LIMIT || 25))
+);
+
 app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
@@ -140,6 +161,22 @@ function requireAdmin(req: Request, res: Response): boolean {
   return true;
 }
 
+function round3(n: number) {
+  return Number(Number(n || 0).toFixed(3));
+}
+
+function formatAmount3(n: number | string) {
+  const value = Number(n || 0);
+  if (!Number.isFinite(value)) return "0.000";
+  return value.toFixed(3);
+}
+
+function parseAmount3(raw: unknown) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  return round3(value);
+}
+
 function sanitizeWager(raw: unknown) {
   const wager = Math.floor(Number(raw));
   if (!Number.isFinite(wager)) return null;
@@ -165,6 +202,278 @@ function serializeGreedIntent(row: any) {
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
   };
+}
+
+async function generateUniqueExactAmount(requestedWager: number) {
+  const base = Math.floor(requestedWager);
+
+  for (let i = 0; i < 60; i++) {
+    const decimalPart = Math.floor(Math.random() * 999) + 1; // 001..999
+    const exact = `${base}.${String(decimalPart).padStart(3, "0")}`;
+
+    const existing = await pool.query(
+      `
+      SELECT 1
+      FROM greed_deposit_intents
+      WHERE exact_amount = $1::numeric
+        AND status IN ('pending', 'funded')
+        AND expires_at > NOW()
+      LIMIT 1;
+      `,
+      [exact]
+    );
+
+    if ((existing.rowCount || 0) === 0) {
+      return Number(exact);
+    }
+  }
+
+  for (let decimalPart = 1; decimalPart <= 999; decimalPart++) {
+    const exact = `${base}.${String(decimalPart).padStart(3, "0")}`;
+
+    const existing = await pool.query(
+      `
+      SELECT 1
+      FROM greed_deposit_intents
+      WHERE exact_amount = $1::numeric
+        AND status IN ('pending', 'funded')
+        AND expires_at > NOW()
+      LIMIT 1;
+      `,
+      [exact]
+    );
+
+    if ((existing.rowCount || 0) === 0) {
+      return Number(exact);
+    }
+  }
+
+  throw new Error("Could not generate unique exact funding amount");
+}
+// -------------------------------
+// Solana watcher helpers
+// -------------------------------
+const solanaConnection = SOLANA_WATCH_ENABLED ? new Connection(SOLANA_RPC_URL, "confirmed") : null;
+let greedWatcherTimer: NodeJS.Timeout | null = null;
+let greedWatcherBusy = false;
+let greedWatcherLastSeenSignature = "";
+
+function extractAccountKeyStrings(tx: any): string[] {
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  return keys.map((k: any) => {
+    if (typeof k === "string") return k;
+    if (k?.pubkey?.toBase58) return k.pubkey.toBase58();
+    if (typeof k?.pubkey === "string") return k.pubkey;
+    return "";
+  });
+}
+
+function getRawAmountFromTokenBalanceEntry(entry: any): bigint {
+  try {
+    const raw = String(entry?.uiTokenAmount?.amount || "0");
+    return BigInt(raw);
+  } catch {
+    return 0n;
+  }
+}
+
+function getDecimalsFromTokenBalanceEntry(entry: any): number {
+  const decimals = Number(entry?.uiTokenAmount?.decimals ?? 0);
+  return Number.isFinite(decimals) ? Math.max(0, decimals) : 0;
+}
+
+function bigintAmountToDecimal(raw: bigint, decimals: number): number {
+  const sign = raw < 0n ? -1 : 1;
+  const abs = raw < 0n ? -raw : raw;
+  const divisor = 10 ** decimals;
+  const whole = Number(abs / BigInt(divisor));
+  const fraction = Number(abs % BigInt(divisor)) / divisor;
+  return sign * (whole + fraction);
+}
+
+function extractObservedDepositFromParsedTx(parsedTx: any): {
+  exactAmount: number | null;
+  senderWallet: string | null;
+  tokenMint: string | null;
+} {
+  const meta = parsedTx?.meta;
+  const tx = parsedTx?.transaction;
+  if (!meta || !tx) {
+    return { exactAmount: null, senderWallet: null, tokenMint: null };
+  }
+
+  const accountKeys = extractAccountKeyStrings(parsedTx);
+  const preTokenBalances = Array.isArray(meta.preTokenBalances) ? meta.preTokenBalances : [];
+  const postTokenBalances = Array.isArray(meta.postTokenBalances) ? meta.postTokenBalances : [];
+
+  const balanceByIndexPre = new Map<number, any>();
+  const balanceByIndexPost = new Map<number, any>();
+
+  for (const entry of preTokenBalances) {
+    const idx = Number(entry?.accountIndex);
+    if (Number.isFinite(idx)) balanceByIndexPre.set(idx, entry);
+  }
+
+  for (const entry of postTokenBalances) {
+    const idx = Number(entry?.accountIndex);
+    if (Number.isFinite(idx)) balanceByIndexPost.set(idx, entry);
+  }
+
+  let bestMatch: { exactAmount: number; tokenMint: string | null } | null = null;
+
+  const candidateIndexes = new Set<number>([
+    ...Array.from(balanceByIndexPre.keys()),
+    ...Array.from(balanceByIndexPost.keys()),
+  ]);
+
+  for (const idx of candidateIndexes) {
+    const accountAddress = String(accountKeys[idx] || "");
+    if (!accountAddress || accountAddress !== DEPOSIT_WALLET) continue;
+
+    const pre = balanceByIndexPre.get(idx) || null;
+    const post = balanceByIndexPost.get(idx) || null;
+
+    const mint = String(post?.mint || pre?.mint || "").trim() || null;
+    if (PHAT_TOKEN_MINT && mint && mint !== PHAT_TOKEN_MINT) continue;
+
+    const decimals = getDecimalsFromTokenBalanceEntry(post || pre);
+    const preRaw = getRawAmountFromTokenBalanceEntry(pre);
+    const postRaw = getRawAmountFromTokenBalanceEntry(post);
+    const deltaRaw = postRaw - preRaw;
+
+    if (deltaRaw <= 0n) continue;
+
+    const delta = round3(bigintAmountToDecimal(deltaRaw, decimals));
+    if (delta <= 0) continue;
+
+    bestMatch = {
+      exactAmount: delta,
+      tokenMint: mint,
+    };
+    break;
+  }
+
+  const senderWallet =
+    accountKeys.find((k) => !!k && k !== DEPOSIT_WALLET) || null;
+
+  return {
+    exactAmount: bestMatch?.exactAmount ?? null,
+    senderWallet,
+    tokenMint: bestMatch?.tokenMint ?? PHAT_TOKEN_MINT ?? null,
+  };
+}
+
+async function processSolanaDepositSignature(signature: string) {
+  if (!signature) return;
+
+  const alreadyProcessed = await hasDepositTxSignature(signature);
+  if (alreadyProcessed) return;
+
+  if (!solanaConnection) return;
+
+  const parsedTx = await solanaConnection.getParsedTransaction(signature, {
+    commitment: "confirmed",
+    maxSupportedTransactionVersion: 0,
+  });
+
+  if (!parsedTx || parsedTx.meta?.err) return;
+
+  const observed = extractObservedDepositFromParsedTx(parsedTx);
+  if (!observed.exactAmount || observed.exactAmount <= 0) return;
+
+  const exactAmount = Number(formatAmount3(observed.exactAmount));
+  const matchingIntent = await findGreedDepositIntentByExactAmount({
+    exactAmount,
+    status: "pending",
+  });
+
+  if (!matchingIntent) return;
+
+  const funded = await markGreedDepositIntentFunded({
+    id: Number(matchingIntent.id),
+    address: String(matchingIntent.address),
+    txSignature: signature,
+    senderWallet: observed.senderWallet,
+    tokenMint: observed.tokenMint || PHAT_TOKEN_MINT,
+  });
+
+  if (!funded) return;
+
+  await recordDeposit({
+    address: String(funded.address),
+    txSignature: signature,
+    senderWallet: observed.senderWallet,
+    tokenMint: observed.tokenMint || PHAT_TOKEN_MINT,
+    amount: Number(funded.exact_amount || exactAmount),
+    status: "credited",
+    note: "greed intent funded by watcher",
+  });
+
+  console.log(
+    `✅ Greed watcher funded intent #${funded.id} for ${funded.address} with ${formatAmount3(
+      funded.exact_amount || exactAmount
+    )} ${observed.tokenMint || PHAT_TOKEN_MINT}`
+  );
+}
+
+async function tickGreedSolanaWatcher() {
+  if (!SOLANA_WATCH_ENABLED || !solanaConnection || !DEPOSIT_WALLET) return;
+  if (greedWatcherBusy) return;
+
+  greedWatcherBusy = true;
+
+  try {
+    const depositWalletPk = new PublicKey(DEPOSIT_WALLET);
+    const signatures = await solanaConnection.getSignaturesForAddress(
+      depositWalletPk,
+      { limit: SOLANA_WATCH_SIGNATURE_LIMIT },
+      "confirmed"
+    );
+
+    if (!signatures.length) return;
+
+    const newestSignature = signatures[0]?.signature || "";
+    const ordered = [...signatures].reverse();
+
+    for (const entry of ordered) {
+      if (!entry?.signature) continue;
+      if (greedWatcherLastSeenSignature && entry.signature === greedWatcherLastSeenSignature) continue;
+      await processSolanaDepositSignature(entry.signature);
+    }
+
+    greedWatcherLastSeenSignature = newestSignature;
+  } catch (e) {
+    console.error("❌ Greed Solana watcher tick failed:", e);
+  } finally {
+    greedWatcherBusy = false;
+  }
+}
+
+function startGreedSolanaWatcher() {
+  if (!SOLANA_WATCH_ENABLED) {
+    console.warn("⚠️ SOLANA_WATCH_ENABLED=false. Greed watcher disabled.");
+    return;
+  }
+
+  if (!DEPOSIT_WALLET) {
+    console.warn("⚠️ No DEPOSIT_WALLET set. Greed watcher disabled.");
+    return;
+  }
+
+  if (!PHAT_TOKEN_MINT) {
+    console.warn("⚠️ No PHAT_TOKEN_MINT set. Greed watcher disabled.");
+    return;
+  }
+
+  console.log(`👀 Greed Solana watcher starting on ${DEPOSIT_WALLET}`);
+  console.log(`🔗 RPC: ${SOLANA_RPC_URL}`);
+  console.log(`⏱️ Watch interval: ${SOLANA_WATCH_INTERVAL_MS}ms`);
+
+  tickGreedSolanaWatcher().catch((e) => console.error("Initial watcher tick failed:", e));
+
+  greedWatcherTimer = setInterval(() => {
+    tickGreedSolanaWatcher().catch((e) => console.error("Watcher interval failed:", e));
+  }, SOLANA_WATCH_INTERVAL_MS);
 }
 
 // -------------------------------
@@ -224,7 +533,6 @@ async function getTodayAgg(address: string, game: GameKey) {
     bestScore: Number(row.best_score || 0),
   };
 }
-
 function computeEarnedCalories(params: { game: GameKey; score: number; miles: number; bestSeconds: number; durationMs: number }) {
   const { game } = params;
 
@@ -372,6 +680,14 @@ app.get("/health", (_req: Request, res: Response) =>
     ok: true,
     service: "planetfatness-backend",
     ts: nowIso(),
+    watcher: {
+      enabled: SOLANA_WATCH_ENABLED,
+      depositWallet: DEPOSIT_WALLET || null,
+      tokenMint: PHAT_TOKEN_MINT || null,
+      rpc: SOLANA_RPC_URL || null,
+      intervalMs: SOLANA_WATCH_INTERVAL_MS,
+      lastSeenSignature: greedWatcherLastSeenSignature || null,
+    },
   })
 );
 
@@ -405,16 +721,20 @@ app.get("/wallet/deposit-info", requireAuth, async (_req: Request, res: Response
     treasuryWallet: String(process.env.TREASURY_WALLET || "").trim() || null,
     acceptedToken: PHAT_TOKEN_MINT,
     mode: "intent-funding",
+    watcher: {
+      enabled: SOLANA_WATCH_ENABLED,
+      intervalMs: SOLANA_WATCH_INTERVAL_MS,
+    },
   });
 });
 
 app.post("/wallet/withdraw", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
-    const amount = Math.floor(Number(req.body?.amount));
+    const amount = parseAmount3(req.body?.amount);
     const destinationWallet = String(req.body?.destinationWallet || address).trim();
 
-    if (!Number.isFinite(amount) || amount <= 0) {
+    if (amount == null || amount <= 0) {
       return res.status(400).json({ error: "Invalid amount" });
     }
 
@@ -493,7 +813,6 @@ app.get("/activity/me", requireAuth, async (req: Request, res: Response) => {
     totalMiles: Number(me.total_miles || 0),
   });
 });
-
 app.get("/activity/summary", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -754,7 +1073,6 @@ app.post("/greed/deposit-intent", requireAuth, async (req: Request, res: Respons
     await expireStaleGreedDepositIntents(address);
 
     const existing = await getOpenGreedDepositIntentByAddress(address);
-
     if (existing) {
       return res.json({
         ok: true,
@@ -763,10 +1081,12 @@ app.post("/greed/deposit-intent", requireAuth, async (req: Request, res: Respons
       });
     }
 
+    const exactAmount = await generateUniqueExactAmount(wager);
+
     const intent = await createGreedDepositIntent({
       address,
       requestedWager: wager,
-      exactAmount: wager,
+      exactAmount,
       depositWallet: DEPOSIT_WALLET,
       tokenMint: PHAT_TOKEN_MINT,
       expiresInMinutes: GREED_INTENT_EXPIRES_MINUTES,
@@ -806,7 +1126,6 @@ app.post("/greed/deposit-intent/:id/cancel", requireAuth, async (req: Request, r
     return res.status(500).json({ error: "Failed to cancel deposit intent" });
   }
 });
-
 // -------------------------------
 // Greed API
 // -------------------------------
@@ -823,9 +1142,9 @@ app.get("/greed/jackpot", async (_req: Request, res: Response) => {
 app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
-    const wager = sanitizeWager(req.body?.wager);
+    const requestedWager = sanitizeWager(req.body?.wager);
 
-    if (wager == null) {
+    if (requestedWager == null) {
       return res.status(400).json({ error: `Wager must be between ${GREED_MIN_WAGER} and ${GREED_MAX_WAGER}` });
     }
 
@@ -856,9 +1175,9 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
     }
 
     const intentWager = Number(openIntent.requested_wager || 0);
-    const intentAmount = Number(openIntent.exact_amount || 0);
+    const exactAmount = round3(Number(openIntent.exact_amount || 0));
 
-    if (intentWager !== wager || intentAmount !== wager) {
+    if (intentWager !== requestedWager) {
       return res.status(400).json({
         error: "Wager does not match funded intent",
         code: "INTENT_WAGER_MISMATCH",
@@ -878,10 +1197,9 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       });
     }
 
-    const creditAmount = Number(consumedIntent.exact_amount || wager);
-    await creditBalance({ address, amount: creditAmount });
+    await creditBalance({ address, amount: exactAmount });
 
-    const debited = await debitBalance({ address, amount: wager });
+    const debited = await debitBalance({ address, amount: exactAmount });
     if (!debited) {
       return res.status(409).json({
         error: "Failed to lock funded wager",
@@ -889,8 +1207,9 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       });
     }
 
-    const netStake = Math.floor(wager * (1 - GREED_TAX));
-    const jackpotFeed = Math.floor(wager * GREED_JACKPOT_FEED_RATE);
+    const lockedWager = round3(exactAmount);
+    const netStake = round3(lockedWager * (1 - GREED_TAX));
+    const jackpotFeed = round3(lockedWager * GREED_JACKPOT_FEED_RATE);
     await addToGreedJackpot(jackpotFeed);
 
     const serverSeed = crypto.randomBytes(32).toString("hex");
@@ -900,7 +1219,7 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
 
     const round = await createGreedRound({
       address,
-      wager,
+      wager: lockedWager,
       netStake,
       poisonIndices,
       seed: serverSeed,
@@ -911,7 +1230,9 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
     return res.json({
       ok: true,
       roundId: round.id,
-      wager,
+      requestedWager,
+      fundedExactAmount: lockedWager,
+      wager: lockedWager,
       netStake,
       jackpotFeed,
       totalDonuts: GREED_TOTAL_DONUTS,
@@ -1029,9 +1350,9 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
 
     if (newSafeClicks >= 10) {
       const jackpotState = await getGreedJackpotState();
-      const jackpotWon = Number(jackpotState?.current_amount || 0);
-      const basePayout = Math.floor(Number(lockedRound.net_stake) * newMultiplier);
-      const totalPayout = basePayout + jackpotWon;
+      const jackpotWon = round3(Number(jackpotState?.current_amount || 0));
+      const basePayout = round3(Number(lockedRound.net_stake || 0) * newMultiplier);
+      const totalPayout = round3(basePayout + jackpotWon);
 
       const closed = await closeGreedRoundAsCashout({
         roundId,
@@ -1058,7 +1379,7 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         calories: 0,
         miles: 0,
         bestSeconds: 0,
-        score: totalPayout,
+        score: Math.floor(totalPayout),
         durationMs: 0,
       });
 
@@ -1172,7 +1493,7 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
     }
 
     const currentMultiplier = Number(lockedRound.current_multiplier || 1.0);
-    const payout = Math.floor(Number(lockedRound.net_stake) * currentMultiplier);
+    const payout = round3(Number(lockedRound.net_stake || 0) * currentMultiplier);
 
     const closed = await closeGreedRoundAsCashout({
       roundId,
@@ -1198,7 +1519,7 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
       calories: 0,
       miles: 0,
       bestSeconds: 0,
-      score: payout,
+      score: Math.floor(payout),
       durationMs: 0,
     });
 
@@ -1347,7 +1668,6 @@ app.get("/leaderboard/games", async (req: Request, res: Response) => {
     const limit = req.query.limit ? Number(req.query.limit) : 3;
 
     const games: GameKey[] = ["runner", "snack", "lift", "basket", "greed"];
-
     const out: any = { ok: true, window, limit, games: {} as any };
 
     for (const g of games) {
@@ -1378,12 +1698,12 @@ app.post("/admin/deposit-credit", async (req: Request, res: Response) => {
     const txSignature = String(req.body?.txSignature || "").trim();
     const senderWallet = String(req.body?.senderWallet || "").trim() || null;
     const tokenMint = String(req.body?.tokenMint || "").trim() || null;
-    const amount = Math.floor(Number(req.body?.amount || 0));
+    const amount = parseAmount3(req.body?.amount);
     const note = String(req.body?.note || "manual admin credit").trim();
 
     if (!address) return res.status(400).json({ error: "Missing address" });
     if (!txSignature) return res.status(400).json({ error: "Missing txSignature" });
-    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+    if (amount == null || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
 
     const exists = await hasDepositTxSignature(txSignature);
     if (exists) return res.status(400).json({ error: "Transaction already processed" });
@@ -1416,7 +1736,7 @@ app.post("/admin/greed/fund-intent", async (req: Request, res: Response) => {
     const txSignature = String(req.body?.txSignature || "").trim();
     const senderWallet = String(req.body?.senderWallet || "").trim() || null;
     const tokenMint = String(req.body?.tokenMint || "").trim() || PHAT_TOKEN_MINT;
-    const exactAmount = Math.floor(Number(req.body?.exactAmount || 0));
+    const exactAmount = parseAmount3(req.body?.exactAmount);
     const explicitIntentId = Math.floor(Number(req.body?.intentId || 0));
 
     let intent: any = null;
@@ -1433,6 +1753,9 @@ app.post("/admin/greed/fund-intent", async (req: Request, res: Response) => {
       );
       intent = row.rows[0] || null;
     } else {
+      if (exactAmount == null) {
+        return res.status(400).json({ error: "Missing exactAmount" });
+      }
       intent = await findGreedDepositIntentByExactAmount({
         exactAmount,
         status: "pending",
@@ -1489,8 +1812,8 @@ app.post("/admin/jackpot/reseed", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   try {
-    const amount = Math.max(0, Math.floor(Number(req.body?.amount || GREED_JACKPOT_RESEED)));
-    const row = await setGreedJackpotAmount(amount);
+    const amount = parseAmount3(req.body?.amount ?? GREED_JACKPOT_RESEED);
+    const row = await setGreedJackpotAmount(amount == null ? GREED_JACKPOT_RESEED : amount);
     return res.json({ ok: true, jackpot: row });
   } catch (e) {
     console.error(e);
@@ -1693,6 +2016,8 @@ try {
   } else {
     console.warn("⚠️ No TG_BOT_TOKEN found in environment.");
   }
+
+  startGreedSolanaWatcher();
 
   app.listen(PORT, () => console.log(`✅ Planet Fatness backend on :${PORT}`));
 } catch (e) {
