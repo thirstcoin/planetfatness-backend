@@ -102,6 +102,22 @@ const SOLANA_WATCH_SIGNATURE_LIMIT = Math.max(
   Math.min(50, Number(process.env.SOLANA_WATCH_SIGNATURE_LIMIT || 25))
 );
 
+// Spectator / live loop config
+const GREED_SPECTATOR_ENABLED =
+  String(process.env.GREED_SPECTATOR_ENABLED || "true").trim().toLowerCase() !== "false";
+
+const GREED_SPECTATOR_CHAT_ID = String(process.env.GREED_SPECTATOR_CHAT_ID || "").trim();
+
+const GREED_SHOUT_INTERVAL_MS = Math.max(
+  15000,
+  Math.min(180000, Number(process.env.GREED_SHOUT_INTERVAL_MS || 45000))
+);
+
+const GREED_MIN_IDLE_FOR_SHOUT_MS = Math.max(
+  8000,
+  Math.min(120000, Number(process.env.GREED_MIN_IDLE_FOR_SHOUT_MS || 20000))
+);
+
 app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
@@ -114,6 +130,25 @@ app.use(
 // Helpers
 // -------------------------------
 type GameKey = "runner" | "snack" | "lift" | "basket" | "greed";
+
+type SpectatorRoundState = {
+  roundId: number;
+  address: string;
+  displayName: string;
+  wager: number;
+  fundedExactAmount: number;
+  chatId: string;
+  startedAt: number;
+  updatedAt: number;
+  safeClicks: number;
+  isActive: boolean;
+};
+
+const liveSpectatorRounds = new Map<number, SpectatorRoundState>();
+let greedWatcherTimer: NodeJS.Timeout | null = null;
+let greedShoutTimer: NodeJS.Timeout | null = null;
+let greedWatcherBusy = false;
+let greedWatcherLastSeenSignature = "";
 
 function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
@@ -204,11 +239,43 @@ function serializeGreedIntent(row: any) {
   };
 }
 
+function maskAddress(address: string) {
+  const a = String(address || "").trim();
+  if (!a) return "Unknown";
+  if (a.startsWith("tg:")) return a;
+  if (a.length <= 10) return a;
+  return `${a.slice(0, 4)}...${a.slice(-4)}`;
+}
+
+function displayNameFromUserRow(userRow: any, fallbackAddress: string) {
+  const direct = String(userRow?.display_name || "").trim();
+  if (direct) return direct;
+
+  const tgUsername = String(userRow?.tg_username || "").trim();
+  if (tgUsername) return `@${tgUsername.replace(/^@/, "")}`;
+
+  const first = String(userRow?.tg_first_name || "").trim();
+  const last = String(userRow?.tg_last_name || "").trim();
+  const combined = [first, last].filter(Boolean).join(" ").trim();
+  if (combined) return combined;
+
+  return maskAddress(fallbackAddress);
+}
+
+async function getDisplayNameForAddress(address: string) {
+  try {
+    const me = await getMe(address);
+    return displayNameFromUserRow(me, address);
+  } catch {
+    return maskAddress(address);
+  }
+}
+
 async function generateUniqueExactAmount(requestedWager: number) {
   const base = Math.floor(requestedWager);
 
   for (let i = 0; i < 60; i++) {
-    const decimalPart = Math.floor(Math.random() * 999) + 1; // 001..999
+    const decimalPart = Math.floor(Math.random() * 999) + 1;
     const exact = `${base}.${String(decimalPart).padStart(3, "0")}`;
 
     const existing = await pool.query(
@@ -250,13 +317,136 @@ async function generateUniqueExactAmount(requestedWager: number) {
 
   throw new Error("Could not generate unique exact funding amount");
 }
+
+function getSpectatorChatIdFromReq(req: Request) {
+  const bodyChatId = String((req.body as any)?.spectatorChatId || "").trim();
+  const queryChatId = String(req.query?.spectatorChatId || "").trim();
+  return bodyChatId || queryChatId || GREED_SPECTATOR_CHAT_ID || "";
+}
+
+async function sendGymSpectatorMessage(text: string, extra?: Record<string, any>) {
+  if (!GREED_SPECTATOR_ENABLED) return;
+  if (!GREED_SPECTATOR_CHAT_ID) return;
+  if (!process.env.TG_BOT_TOKEN) return;
+
+  try {
+    await gymBot.telegram.sendMessage(GREED_SPECTATOR_CHAT_ID, text, {
+      disable_web_page_preview: true,
+      ...(extra || {}),
+    });
+  } catch (e) {
+    console.error("Spectator message failed:", e);
+  }
+}
+
+async function sendGymSpectatorMessageToChat(chatId: string, text: string, extra?: Record<string, any>) {
+  if (!GREED_SPECTATOR_ENABLED) return;
+  if (!chatId) return;
+  if (!process.env.TG_BOT_TOKEN) return;
+
+  try {
+    await gymBot.telegram.sendMessage(chatId, text, {
+      disable_web_page_preview: true,
+      ...(extra || {}),
+    });
+  } catch (e) {
+    console.error("Spectator message to chat failed:", e);
+  }
+}
+
+function pickCardEmojis() {
+  return ["🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩"];
+}
+
+function formatDonutBoardLine() {
+  const donuts = pickCardEmojis();
+  return donuts.map((d, i) => `${d}${i + 1}`).join("  ");
+}
+
+function safeMultiplierLabel(safeClicks: number) {
+  if (safeClicks <= 0) return "x1.00";
+  return `x${GREED_MULTIPLIERS[Math.min(safeClicks - 1, GREED_MULTIPLIERS.length - 1)].toFixed(2)}`;
+}
+
+const shoutTemplates = [
+  "Chat is screaming for donut #{pick}.",
+  "The room says #{pick} is blessed.",
+  "A degen in the crowd is demanding donut #{pick}.",
+  "Phil is staring hard at donut #{pick}.",
+  "The glaze committee is leaning toward #{pick}.",
+  "Crowd temperature says donut #{pick} looks lucky.",
+  "A couch-certified analyst likes #{pick}.",
+  "The gym floor is yelling for #{pick}.",
+  "Suspiciously many people are calling #{pick}.",
+  "Greed radar says #{pick} might print.",
+];
+
+function randomInt(min: number, max: number) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function buildRandomShout(state: SpectatorRoundState) {
+  const pick = randomInt(1, 12);
+  const template = shoutTemplates[randomInt(0, shoutTemplates.length - 1)];
+  return `🍩 LIVE GREED • ${state.displayName}\n${template.replace("#{pick}", String(pick))}\nCurrent safe picks: ${state.safeClicks} • Current target: ${safeMultiplierLabel(state.safeClicks)}`;
+}
+
+function registerLiveRound(state: SpectatorRoundState) {
+  liveSpectatorRounds.set(state.roundId, state);
+}
+
+function updateLiveRound(roundId: number, patch: Partial<SpectatorRoundState>) {
+  const existing = liveSpectatorRounds.get(roundId);
+  if (!existing) return;
+  liveSpectatorRounds.set(roundId, {
+    ...existing,
+    ...patch,
+    updatedAt: Date.now(),
+  });
+}
+
+function closeLiveRound(roundId: number) {
+  const existing = liveSpectatorRounds.get(roundId);
+  if (!existing) return;
+  liveSpectatorRounds.set(roundId, {
+    ...existing,
+    isActive: false,
+    updatedAt: Date.now(),
+  });
+  liveSpectatorRounds.delete(roundId);
+}
+
+function startGreedShoutLoop() {
+  if (!GREED_SPECTATOR_ENABLED) return;
+  if (!GREED_SPECTATOR_CHAT_ID) return;
+  if (!process.env.TG_BOT_TOKEN) return;
+
+  if (greedShoutTimer) {
+    clearInterval(greedShoutTimer);
+  }
+
+  greedShoutTimer = setInterval(async () => {
+    try {
+      const now = Date.now();
+
+      for (const state of liveSpectatorRounds.values()) {
+        if (!state.isActive) continue;
+        if (now - state.updatedAt < GREED_MIN_IDLE_FOR_SHOUT_MS) continue;
+
+        const msg = buildRandomShout(state);
+        await sendGymSpectatorMessageToChat(state.chatId, msg);
+        updateLiveRound(state.roundId, {});
+      }
+    } catch (e) {
+      console.error("Greed shout loop failed:", e);
+    }
+  }, GREED_SHOUT_INTERVAL_MS);
+}
+
 // -------------------------------
 // Solana watcher helpers
 // -------------------------------
 const solanaConnection = SOLANA_WATCH_ENABLED ? new Connection(SOLANA_RPC_URL, "confirmed") : null;
-let greedWatcherTimer: NodeJS.Timeout | null = null;
-let greedWatcherBusy = false;
-let greedWatcherLastSeenSignature = "";
 
 function extractAccountKeyStrings(tx: any): string[] {
   const keys = tx?.transaction?.message?.accountKeys || [];
@@ -533,6 +723,7 @@ async function getTodayAgg(address: string, game: GameKey) {
     bestScore: Number(row.best_score || 0),
   };
 }
+
 function computeEarnedCalories(params: { game: GameKey; score: number; miles: number; bestSeconds: number; durationMs: number }) {
   const { game } = params;
 
@@ -688,6 +879,12 @@ app.get("/health", (_req: Request, res: Response) =>
       intervalMs: SOLANA_WATCH_INTERVAL_MS,
       lastSeenSignature: greedWatcherLastSeenSignature || null,
     },
+    spectator: {
+      enabled: GREED_SPECTATOR_ENABLED,
+      chatId: GREED_SPECTATOR_CHAT_ID || null,
+      shoutIntervalMs: GREED_SHOUT_INTERVAL_MS,
+      activeRounds: liveSpectatorRounds.size,
+    },
   })
 );
 
@@ -813,6 +1010,7 @@ app.get("/activity/me", requireAuth, async (req: Request, res: Response) => {
     totalMiles: Number(me.total_miles || 0),
   });
 });
+
 app.get("/activity/summary", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -1126,6 +1324,7 @@ app.post("/greed/deposit-intent/:id/cancel", requireAuth, async (req: Request, r
     return res.status(500).json({ error: "Failed to cancel deposit intent" });
   }
 });
+
 // -------------------------------
 // Greed API
 // -------------------------------
@@ -1143,6 +1342,7 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
     const requestedWager = sanitizeWager(req.body?.wager);
+    const spectatorChatId = getSpectatorChatIdFromReq(req);
 
     if (requestedWager == null) {
       return res.status(400).json({ error: `Wager must be between ${GREED_MIN_WAGER} and ${GREED_MAX_WAGER}` });
@@ -1227,6 +1427,43 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       nonce,
     });
 
+    const displayName = await getDisplayNameForAddress(address);
+
+    if (GREED_SPECTATOR_ENABLED && spectatorChatId) {
+      registerLiveRound({
+        roundId: Number(round.id),
+        address,
+        displayName,
+        wager: requestedWager,
+        fundedExactAmount: lockedWager,
+        chatId: spectatorChatId,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        safeClicks: 0,
+        isActive: true,
+      });
+
+      await sendGymSpectatorMessageToChat(
+        spectatorChatId,
+        [
+          `🍩 FEED YOUR GREED LIVE`,
+          ``,
+          `${displayName} just locked a round.`,
+          `Requested wager: ${formatAmount3(requestedWager)} PHAT`,
+          `Locked amount: ${formatAmount3(lockedWager)} PHAT`,
+          `Round ID: #${Number(round.id)}`,
+          ``,
+          `Pick your donut in chat before they do 👇`,
+          `${formatDonutBoardLine()}`,
+        ].join("\n"),
+        {
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+          ]).reply_markup,
+        }
+      );
+    }
+
     return res.json({
       ok: true,
       roundId: round.id,
@@ -1299,6 +1536,7 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
       : [];
 
     const isPoison = poisonIndices.includes(pickedIndex);
+    const liveState = liveSpectatorRounds.get(roundId);
 
     if (isPoison) {
       await recordGreedPick({
@@ -1320,6 +1558,19 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
 
       if (!closed) {
         return res.status(409).json({ error: "Round could not be closed" });
+      }
+
+      if (liveState) {
+        await sendGymSpectatorMessageToChat(
+          liveState.chatId,
+          [
+            `☠️ BUST`,
+            `${liveState.displayName} picked donut #${pickedIndex + 1}`,
+            `Result: POISON`,
+            `Round over at ${safeMultiplierLabel(Number(closed.safe_clicks || 0))}`,
+          ].join("\n")
+        );
+        closeLiveRound(roundId);
       }
 
       return res.json({
@@ -1383,6 +1634,20 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         durationMs: 0,
       });
 
+      if (liveState) {
+        await sendGymSpectatorMessageToChat(
+          liveState.chatId,
+          [
+            `👑 PERFECT RUN`,
+            `${liveState.displayName} survived all 10 safe donuts.`,
+            `Final multiplier: x${newMultiplier.toFixed(2)}`,
+            `Jackpot won: ${formatAmount3(jackpotWon)} PHAT`,
+            `Total payout: ${formatAmount3(totalPayout)} PHAT`,
+          ].join("\n")
+        );
+        closeLiveRound(roundId);
+      }
+
       return res.json({
         ok: true,
         result: "perfect",
@@ -1413,6 +1678,25 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
 
     if (!updated) {
       return res.status(409).json({ error: "Round progress update failed" });
+    }
+
+    if (liveState) {
+      updateLiveRound(roundId, {
+        safeClicks: newSafeClicks,
+      });
+
+      let spectatorText = [
+        `✅ SAFE PICK`,
+        `${liveState.displayName} picked donut #${pickedIndex + 1}`,
+        `Safe clicks: ${newSafeClicks}`,
+        `Current multiplier: x${newMultiplier.toFixed(2)}`,
+      ].join("\n");
+
+      if (newSafeClicks === 9) {
+        spectatorText += `\n🔥 FINAL DONUT LIVE`;
+      }
+
+      await sendGymSpectatorMessageToChat(liveState.chatId, spectatorText);
     }
 
     return res.json({
@@ -1522,6 +1806,21 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
       score: Math.floor(payout),
       durationMs: 0,
     });
+
+    const liveState = liveSpectatorRounds.get(roundId);
+    if (liveState) {
+      await sendGymSpectatorMessageToChat(
+        liveState.chatId,
+        [
+          `💸 CASH OUT`,
+          `${liveState.displayName} bailed out safely.`,
+          `Safe clicks: ${safeClicks}`,
+          `Multiplier: x${currentMultiplier.toFixed(2)}`,
+          `Payout: ${formatAmount3(payout)} PHAT`,
+        ].join("\n")
+      );
+      closeLiveRound(roundId);
+    }
 
     return res.json({
       ok: true,
@@ -1978,6 +2277,20 @@ gymBot.command("greed", async (ctx) => {
   }
 });
 
+gymBot.command("greedlive", async (ctx) => {
+  try {
+    await ctx.reply(
+      [
+        "🍩 FEED YOUR GREED LIVE",
+        "Watch the next degen lock a round and scream your donut pick in chat.",
+      ].join("\n"),
+      Markup.inlineKeyboard([[Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]])
+    );
+  } catch (e) {
+    console.error("GYM /greedlive button error:", e);
+  }
+});
+
 gymBot.on("callback_query", async (ctx) => {
   try {
     const q = ctx.callbackQuery;
@@ -2018,6 +2331,7 @@ try {
   }
 
   startGreedSolanaWatcher();
+  startGreedShoutLoop();
 
   app.listen(PORT, () => console.log(`✅ Planet Fatness backend on :${PORT}`));
 } catch (e) {
