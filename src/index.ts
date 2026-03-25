@@ -78,6 +78,7 @@ const GREED_WEBAPP_URL = String(process.env.GREED_WEBAPP_URL || "https://planetf
 const HUB_WEBAPP_URL = String(process.env.HUB_WEBAPP_URL || "https://planetfatness.fit/").trim();
 
 const DEPOSIT_WALLET = String(process.env.DEPOSIT_WALLET || "").trim();
+const PHAT_TOKEN_ACCOUNT = String(process.env.PHAT_TOKEN_ACCOUNT || "").trim();
 const PHAT_TOKEN_MINT = String(process.env.PHAT_TOKEN_MINT || "").trim() || "PHAT";
 const GREED_INTENT_EXPIRES_MINUTES = Math.max(
   1,
@@ -509,6 +510,8 @@ function extractObservedDepositFromParsedTx(parsedTx: any): {
 
   let bestMatch: { exactAmount: number; tokenMint: string | null } | null = null;
 
+  const watcherTarget = PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET;
+
   const candidateIndexes = new Set<number>([
     ...Array.from(balanceByIndexPre.keys()),
     ...Array.from(balanceByIndexPost.keys()),
@@ -516,7 +519,7 @@ function extractObservedDepositFromParsedTx(parsedTx: any): {
 
   for (const idx of candidateIndexes) {
     const accountAddress = String(accountKeys[idx] || "");
-    if (!accountAddress || accountAddress !== DEPOSIT_WALLET) continue;
+    if (!accountAddress || accountAddress !== watcherTarget) continue;
 
     const pre = balanceByIndexPre.get(idx) || null;
     const post = balanceByIndexPost.get(idx) || null;
@@ -542,7 +545,7 @@ function extractObservedDepositFromParsedTx(parsedTx: any): {
   }
 
   const senderWallet =
-    accountKeys.find((k) => !!k && k !== DEPOSIT_WALLET) || null;
+    accountKeys.find((k) => !!k && k !== DEPOSIT_WALLET && k !== watcherTarget) || null;
 
   return {
     exactAmount: bestMatch?.exactAmount ?? null,
@@ -605,15 +608,16 @@ async function processSolanaDepositSignature(signature: string) {
 }
 
 async function tickGreedSolanaWatcher() {
-  if (!SOLANA_WATCH_ENABLED || !solanaConnection || !DEPOSIT_WALLET) return;
+  const watcherTarget = PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET;
+  if (!SOLANA_WATCH_ENABLED || !solanaConnection || !watcherTarget) return;
   if (greedWatcherBusy) return;
 
   greedWatcherBusy = true;
 
   try {
-    const depositWalletPk = new PublicKey(DEPOSIT_WALLET);
+    const watcherPk = new PublicKey(watcherTarget);
     const signatures = await solanaConnection.getSignaturesForAddress(
-      depositWalletPk,
+      watcherPk,
       { limit: SOLANA_WATCH_SIGNATURE_LIMIT },
       "confirmed"
     );
@@ -638,6 +642,8 @@ async function tickGreedSolanaWatcher() {
 }
 
 function startGreedSolanaWatcher() {
+  const watcherTarget = PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET;
+
   if (!SOLANA_WATCH_ENABLED) {
     console.warn("⚠️ SOLANA_WATCH_ENABLED=false. Greed watcher disabled.");
     return;
@@ -648,12 +654,18 @@ function startGreedSolanaWatcher() {
     return;
   }
 
+  if (!watcherTarget) {
+    console.warn("⚠️ No watcher target set. Greed watcher disabled.");
+    return;
+  }
+
   if (!PHAT_TOKEN_MINT) {
     console.warn("⚠️ No PHAT_TOKEN_MINT set. Greed watcher disabled.");
     return;
   }
 
-  console.log(`👀 Greed Solana watcher starting on ${DEPOSIT_WALLET}`);
+  console.log(`💸 User deposit wallet: ${DEPOSIT_WALLET}`);
+  console.log(`👀 Greed watcher target: ${watcherTarget}`);
   console.log(`🔗 RPC: ${SOLANA_RPC_URL}`);
   console.log(`⏱️ Watch interval: ${SOLANA_WATCH_INTERVAL_MS}ms`);
 
@@ -869,14 +881,16 @@ app.get("/health", (_req: Request, res: Response) =>
     ok: true,
     service: "planetfatness-backend",
     ts: nowIso(),
-    watcher: {
-      enabled: SOLANA_WATCH_ENABLED,
-      depositWallet: DEPOSIT_WALLET || null,
-      tokenMint: PHAT_TOKEN_MINT || null,
-      rpc: SOLANA_RPC_URL || null,
-      intervalMs: SOLANA_WATCH_INTERVAL_MS,
-      lastSeenSignature: greedWatcherLastSeenSignature || null,
-    },
+  watcher: {
+  enabled: SOLANA_WATCH_ENABLED,
+  depositWallet: DEPOSIT_WALLET || null,
+  watcherTarget: PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET || null,
+  tokenAccount: PHAT_TOKEN_ACCOUNT || null,
+  tokenMint: PHAT_TOKEN_MINT || null,
+  rpc: SOLANA_RPC_URL || null,
+  intervalMs: SOLANA_WATCH_INTERVAL_MS,
+  lastSeenSignature: greedWatcherLastSeenSignature || null,
+},
     spectator: {
       enabled: GREED_SPECTATOR_ENABLED,
       chatId: GREED_SPECTATOR_CHAT_ID || null,
@@ -916,10 +930,11 @@ app.get("/wallet/deposit-info", requireAuth, async (_req: Request, res: Response
     treasuryWallet: String(process.env.TREASURY_WALLET || "").trim() || null,
     acceptedToken: PHAT_TOKEN_MINT,
     mode: "intent-funding",
-    watcher: {
-      enabled: SOLANA_WATCH_ENABLED,
-      intervalMs: SOLANA_WATCH_INTERVAL_MS,
-    },
+  watcher: {
+  enabled: SOLANA_WATCH_ENABLED,
+  intervalMs: SOLANA_WATCH_INTERVAL_MS,
+  watcherTarget: PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET || null,
+},
   });
 });
 
