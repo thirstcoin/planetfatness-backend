@@ -331,7 +331,6 @@ async function sendGymSpectatorMessage(text: string, extra?: Record<string, any>
 
   try {
     await gymBot.telegram.sendMessage(GREED_SPECTATOR_CHAT_ID, text, {
-      disable_web_page_preview: true,
       ...(extra || {}),
     });
   } catch (e) {
@@ -346,7 +345,6 @@ async function sendGymSpectatorMessageToChat(chatId: string, text: string, extra
 
   try {
     await gymBot.telegram.sendMessage(chatId, text, {
-      disable_web_page_preview: true,
       ...(extra || {}),
     });
   } catch (e) {
