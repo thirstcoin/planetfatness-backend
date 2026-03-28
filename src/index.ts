@@ -39,6 +39,7 @@ const {
   hasDepositTxSignature,
   recordDeposit,
   createWithdrawal,
+  recordGreedTaxLedger,
   getGreedJackpotState,
   setGreedJackpotAmount,
   addToGreedJackpot,
@@ -832,6 +833,15 @@ function derivePoisonIndicesFromSeed(seed: string, nonce: number, total: number,
   return scores.slice(0, poisonCount).map((x) => x.index).sort((a, b) => a - b);
 }
 
+function getGreedTaxBreakdown(lockedWager: number) {
+  const totalTax = round3(lockedWager * GREED_TAX);
+  const devCut = round3(totalTax * 0.4);
+  const treasuryCut = round3(totalTax * 0.4);
+  const jackpotCut = round3(totalTax - devCut - treasuryCut);
+  const netStake = round3(lockedWager - totalTax);
+  return { totalTax, devCut, treasuryCut, jackpotCut, netStake };
+}
+
 // -------------------------------
 // Routes
 // -------------------------------
@@ -881,16 +891,16 @@ app.get("/health", (_req: Request, res: Response) =>
     ok: true,
     service: "planetfatness-backend",
     ts: nowIso(),
-  watcher: {
-  enabled: SOLANA_WATCH_ENABLED,
-  depositWallet: DEPOSIT_WALLET || null,
-  watcherTarget: PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET || null,
-  tokenAccount: PHAT_TOKEN_ACCOUNT || null,
-  tokenMint: PHAT_TOKEN_MINT || null,
-  rpc: SOLANA_RPC_URL || null,
-  intervalMs: SOLANA_WATCH_INTERVAL_MS,
-  lastSeenSignature: greedWatcherLastSeenSignature || null,
-},
+    watcher: {
+      enabled: SOLANA_WATCH_ENABLED,
+      depositWallet: DEPOSIT_WALLET || null,
+      watcherTarget: PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET || null,
+      tokenAccount: PHAT_TOKEN_ACCOUNT || null,
+      tokenMint: PHAT_TOKEN_MINT || null,
+      rpc: SOLANA_RPC_URL || null,
+      intervalMs: SOLANA_WATCH_INTERVAL_MS,
+      lastSeenSignature: greedWatcherLastSeenSignature || null,
+    },
     spectator: {
       enabled: GREED_SPECTATOR_ENABLED,
       chatId: GREED_SPECTATOR_CHAT_ID || null,
@@ -930,11 +940,11 @@ app.get("/wallet/deposit-info", requireAuth, async (_req: Request, res: Response
     treasuryWallet: String(process.env.TREASURY_WALLET || "").trim() || null,
     acceptedToken: PHAT_TOKEN_MINT,
     mode: "intent-funding",
-  watcher: {
-  enabled: SOLANA_WATCH_ENABLED,
-  intervalMs: SOLANA_WATCH_INTERVAL_MS,
-  watcherTarget: PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET || null,
-},
+    watcher: {
+      enabled: SOLANA_WATCH_ENABLED,
+      intervalMs: SOLANA_WATCH_INTERVAL_MS,
+      watcherTarget: PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET || null,
+    },
   });
 });
 
@@ -1371,57 +1381,81 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
 
     await expireStaleGreedDepositIntents(address);
 
-    const openIntent = await getOpenGreedDepositIntentByAddress(address);
-    if (!openIntent) {
-      return res.status(400).json({
-        error: "No funded deposit intent found",
-        code: "FUNDING_REQUIRED",
+    let lockedWager = 0;
+    let fundedIntentId: number | null = null;
+    let fundingSource: "balance" | "intent" = "balance";
+
+    const bal = await getBalance(address);
+    const available = round3(Number(bal?.available_balance || 0));
+
+    if (available >= requestedWager) {
+      const debited = await debitBalance({ address, amount: requestedWager });
+      if (!debited) {
+        return res.status(409).json({
+          error: "Failed to lock balance wager",
+          code: "BALANCE_WAGER_LOCK_FAILED",
+        });
+      }
+
+      lockedWager = round3(requestedWager);
+      fundingSource = "balance";
+    } else {
+      const openIntent = await getOpenGreedDepositIntentByAddress(address);
+      if (!openIntent) {
+        return res.status(400).json({
+          error: "Funding required",
+          code: "FUNDING_REQUIRED",
+        });
+      }
+
+      if (String(openIntent.status) !== "funded") {
+        return res.status(400).json({
+          error: "Deposit intent not funded yet",
+          code: "INTENT_NOT_FUNDED",
+          intent: serializeGreedIntent(openIntent),
+        });
+      }
+
+      const intentWager = Number(openIntent.requested_wager || 0);
+      const exactAmount = round3(Number(openIntent.exact_amount || 0));
+
+      if (intentWager !== requestedWager) {
+        return res.status(400).json({
+          error: "Wager does not match funded intent",
+          code: "INTENT_WAGER_MISMATCH",
+          intent: serializeGreedIntent(openIntent),
+        });
+      }
+
+      const consumedIntent = await consumeFundedGreedDepositIntent({
+        id: Number(openIntent.id),
+        address,
       });
+
+      if (!consumedIntent) {
+        return res.status(409).json({
+          error: "Funded intent could not be consumed",
+          code: "INTENT_CONSUME_FAILED",
+        });
+      }
+
+      await creditBalance({ address, amount: exactAmount });
+
+      const debited = await debitBalance({ address, amount: exactAmount });
+      if (!debited) {
+        return res.status(409).json({
+          error: "Failed to lock funded wager",
+          code: "FUNDED_WAGER_LOCK_FAILED",
+        });
+      }
+
+      lockedWager = round3(exactAmount);
+      fundedIntentId = Number(consumedIntent.id);
+      fundingSource = "intent";
     }
 
-    if (String(openIntent.status) !== "funded") {
-      return res.status(400).json({
-        error: "Deposit intent not funded yet",
-        code: "INTENT_NOT_FUNDED",
-        intent: serializeGreedIntent(openIntent),
-      });
-    }
+    const { totalTax, devCut, treasuryCut, jackpotCut, netStake } = getGreedTaxBreakdown(lockedWager);
 
-    const intentWager = Number(openIntent.requested_wager || 0);
-    const exactAmount = round3(Number(openIntent.exact_amount || 0));
-
-    if (intentWager !== requestedWager) {
-      return res.status(400).json({
-        error: "Wager does not match funded intent",
-        code: "INTENT_WAGER_MISMATCH",
-        intent: serializeGreedIntent(openIntent),
-      });
-    }
-
-    const consumedIntent = await consumeFundedGreedDepositIntent({
-      id: Number(openIntent.id),
-      address,
-    });
-
-    if (!consumedIntent) {
-      return res.status(409).json({
-        error: "Funded intent could not be consumed",
-        code: "INTENT_CONSUME_FAILED",
-      });
-    }
-
-    await creditBalance({ address, amount: exactAmount });
-
-    const debited = await debitBalance({ address, amount: exactAmount });
-    if (!debited) {
-      return res.status(409).json({
-        error: "Failed to lock funded wager",
-        code: "FUNDED_WAGER_LOCK_FAILED",
-      });
-    }
-
-    const lockedWager = round3(exactAmount);
-    const netStake = round3(lockedWager * (1 - GREED_TAX));
     const jackpotFeed = round3(lockedWager * GREED_JACKPOT_FEED_RATE);
     await addToGreedJackpot(jackpotFeed);
 
@@ -1438,6 +1472,21 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       seed: serverSeed,
       commitHash,
       nonce,
+    });
+
+    await recordGreedTaxLedger({
+      address,
+      roundId: Number(round.id),
+      source: fundingSource === "balance" ? "greed_start_balance" : "greed_start_intent",
+      grossWager: lockedWager,
+      totalTax,
+      devCut,
+      treasuryCut,
+      jackpotCut,
+      note:
+        fundingSource === "balance"
+          ? "greed round started from internal balance"
+          : `greed round started from funded intent${fundedIntentId ? ` #${fundedIntentId}` : ""}`,
     });
 
     const displayName = await getDisplayNameForAddress(address);
@@ -1484,12 +1533,17 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
       fundedExactAmount: lockedWager,
       wager: lockedWager,
       netStake,
+      totalTax,
+      devCut,
+      treasuryCut,
+      jackpotCut,
       jackpotFeed,
+      fundingSource,
       totalDonuts: GREED_TOTAL_DONUTS,
       poisonCount: GREED_POISON_COUNT,
       currentMultiplier: 1.0,
       cashoutAvailable: false,
-      fundedIntentId: Number(consumedIntent.id),
+      fundedIntentId,
       provablyFair: {
         commitHash,
         nonce,
@@ -2151,6 +2205,7 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
     await pool.query(`TRUNCATE TABLE greed_deposit_intents CASCADE;`);
     await pool.query(`TRUNCATE TABLE deposits CASCADE;`);
     await pool.query(`TRUNCATE TABLE withdrawals CASCADE;`);
+    await pool.query(`TRUNCATE TABLE greed_tax_ledger CASCADE;`);
     await pool.query(`UPDATE balances SET available_balance = 0, locked_balance = 0, updated_at = NOW();`);
     await pool.query(`UPDATE jackpot_state SET current_amount = reseed_amount, updated_at = NOW() WHERE key = 'greed';`);
 
@@ -2268,7 +2323,7 @@ gymBot.start(async (ctx) => {
       "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app.",
       Markup.inlineKeyboard([
         [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
-        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
       ])
     );
   } catch (e) {
