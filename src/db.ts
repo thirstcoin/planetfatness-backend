@@ -222,6 +222,11 @@ export async function initDb() {
 
   await pool.query(`
     ALTER TABLE withdrawals
+    ADD COLUMN IF NOT EXISTS tx_signature TEXT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE withdrawals
     ALTER COLUMN amount TYPE NUMERIC(18,3) USING (amount::numeric);
   `);
 
@@ -302,7 +307,49 @@ export async function initDb() {
     ON CONFLICT (key) DO NOTHING;
   `);
 
-  console.log("✅ DB ready (TG + games + Greed + balances + deposits + withdrawals + deposit intents + jackpot)");
+  // Greed tax ledger
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS greed_tax_ledger (
+      id BIGSERIAL PRIMARY KEY,
+      address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
+      round_id BIGINT REFERENCES greed_rounds(id) ON DELETE SET NULL,
+      source TEXT NOT NULL DEFAULT 'greed_start',
+      gross_wager NUMERIC(18,3) NOT NULL DEFAULT 0,
+      total_tax NUMERIC(18,3) NOT NULL DEFAULT 0,
+      dev_cut NUMERIC(18,3) NOT NULL DEFAULT 0,
+      treasury_cut NUMERIC(18,3) NOT NULL DEFAULT 0,
+      jackpot_cut NUMERIC(18,3) NOT NULL DEFAULT 0,
+      note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE greed_tax_ledger
+    ADD COLUMN IF NOT EXISTS round_id BIGINT REFERENCES greed_rounds(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'greed_start',
+    ADD COLUMN IF NOT EXISTS gross_wager NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_tax NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS dev_cut NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS treasury_cut NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS jackpot_cut NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS note TEXT,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  `);
+
+  await pool.query(`
+    ALTER TABLE greed_tax_ledger
+    ALTER COLUMN gross_wager TYPE NUMERIC(18,3) USING (gross_wager::numeric),
+    ALTER COLUMN total_tax TYPE NUMERIC(18,3) USING (total_tax::numeric),
+    ALTER COLUMN dev_cut TYPE NUMERIC(18,3) USING (dev_cut::numeric),
+    ALTER COLUMN treasury_cut TYPE NUMERIC(18,3) USING (treasury_cut::numeric),
+    ALTER COLUMN jackpot_cut TYPE NUMERIC(18,3) USING (jackpot_cut::numeric);
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_tax_ledger_address_created ON greed_tax_ledger(address, created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_tax_ledger_round_id ON greed_tax_ledger(round_id);`);
+
+  console.log("✅ DB ready (TG + games + Greed + balances + deposits + withdrawals + deposit intents + jackpot + tax ledger)");
 }
 
 // -------------------------------
@@ -499,6 +546,7 @@ export async function logSession(params: {
 
   return r.rows[0] || null;
 }
+
 // -------------------------------
 // Leaderboard V2
 // -------------------------------
@@ -977,6 +1025,7 @@ export async function createGreedDepositIntent(params: {
 
   return r.rows[0] || null;
 }
+
 export async function cancelGreedDepositIntent(params: {
   id: number;
   address: string;
@@ -1062,7 +1111,7 @@ export async function findGreedDepositIntentByExactAmount(params: {
       AND status = $2
       AND expires_at > NOW()
     ORDER BY created_at ASC
-    LIMIT 1;
+    LIMIT $1;
     `,
     [exactAmount, status]
   );
@@ -1136,6 +1185,160 @@ export async function createWithdrawal(params: {
   );
 
   return r.rows[0] || null;
+}
+
+export async function markWithdrawalProcessing(params: {
+  withdrawalId: number;
+  note?: string | null;
+}) {
+  const withdrawalId = Math.max(0, Math.floor(Number(params.withdrawalId || 0)));
+  const note = params.note ? String(params.note).trim() : null;
+
+  if (!withdrawalId) throw new Error("missing withdrawalId");
+
+  const r = await pool.query(
+    `
+    UPDATE withdrawals
+    SET
+      status = 'processing',
+      note = COALESCE($2, note),
+      updated_at = NOW()
+    WHERE id = $1
+      AND status = 'pending'
+    RETURNING *;
+    `,
+    [withdrawalId, note]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function markWithdrawalCompleted(params: {
+  withdrawalId: number;
+  txSignature: string;
+  note?: string | null;
+}) {
+  const withdrawalId = Math.max(0, Math.floor(Number(params.withdrawalId || 0)));
+  const txSignature = String(params.txSignature || "").trim();
+  const note = params.note ? String(params.note).trim() : null;
+
+  if (!withdrawalId) throw new Error("missing withdrawalId");
+  if (!txSignature) throw new Error("missing txSignature");
+
+  const r = await pool.query(
+    `
+    UPDATE withdrawals
+    SET
+      status = 'completed',
+      tx_signature = $2,
+      note = COALESCE($3, note),
+      updated_at = NOW()
+    WHERE id = $1
+    RETURNING *;
+    `,
+    [withdrawalId, txSignature, note]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function markWithdrawalFailed(params: {
+  withdrawalId: number;
+  note?: string | null;
+}) {
+  const withdrawalId = Math.max(0, Math.floor(Number(params.withdrawalId || 0)));
+  const note = params.note ? String(params.note).trim() : null;
+
+  if (!withdrawalId) throw new Error("missing withdrawalId");
+
+  const r = await pool.query(
+    `
+    UPDATE withdrawals
+    SET
+      status = 'failed',
+      note = COALESCE($2, note),
+      updated_at = NOW()
+    WHERE id = $1
+    RETURNING *;
+    `,
+    [withdrawalId, note]
+  );
+
+  return r.rows[0] || null;
+}
+
+// -------------------------------
+// Greed tax ledger helpers
+// -------------------------------
+export async function recordGreedTaxLedger(params: {
+  address: string;
+  roundId?: number | null;
+  source?: string;
+  grossWager: number | string;
+  totalTax: number | string;
+  devCut: number | string;
+  treasuryCut: number | string;
+  jackpotCut: number | string;
+  note?: string | null;
+}) {
+  const address = String(params.address || "").trim();
+  const roundId =
+    params.roundId == null ? null : Math.max(0, Math.floor(Number(params.roundId || 0))) || null;
+  const source = String(params.source || "greed_start").trim().slice(0, 64) || "greed_start";
+  const grossWager = asAmount(params.grossWager);
+  const totalTax = asAmount(params.totalTax);
+  const devCut = asAmount(params.devCut);
+  const treasuryCut = asAmount(params.treasuryCut);
+  const jackpotCut = asAmount(params.jackpotCut);
+  const note = params.note ? String(params.note).trim() : null;
+
+  if (!address) throw new Error("missing address");
+
+  await upsertUser(address);
+
+  const r = await pool.query(
+    `
+    INSERT INTO greed_tax_ledger (
+      address,
+      round_id,
+      source,
+      gross_wager,
+      total_tax,
+      dev_cut,
+      treasury_cut,
+      jackpot_cut,
+      note,
+      created_at
+    )
+    VALUES ($1,$2,$3,$4::numeric,$5::numeric,$6::numeric,$7::numeric,$8::numeric,$9,NOW())
+    RETURNING *;
+    `,
+    [address, roundId, source, grossWager, totalTax, devCut, treasuryCut, jackpotCut, note]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function getGreedTreasuryTotals() {
+  const r = await pool.query(
+    `
+    SELECT
+      COALESCE(SUM(gross_wager),0)::DOUBLE PRECISION AS gross_wager,
+      COALESCE(SUM(total_tax),0)::DOUBLE PRECISION AS total_tax,
+      COALESCE(SUM(dev_cut),0)::DOUBLE PRECISION AS dev_cut,
+      COALESCE(SUM(treasury_cut),0)::DOUBLE PRECISION AS treasury_cut,
+      COALESCE(SUM(jackpot_cut),0)::DOUBLE PRECISION AS jackpot_cut
+    FROM greed_tax_ledger;
+    `
+  );
+
+  return r.rows[0] || {
+    gross_wager: 0,
+    total_tax: 0,
+    dev_cut: 0,
+    treasury_cut: 0,
+    jackpot_cut: 0,
+  };
 }
 
 // -------------------------------
@@ -1391,6 +1594,7 @@ export async function updateGreedRoundProgress(params: {
 
   return r.rows[0] || null;
 }
+
 export async function closeGreedRoundAsPoison(params: {
   roundId: number;
   address: string;
