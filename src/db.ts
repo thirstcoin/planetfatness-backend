@@ -232,6 +232,11 @@ export async function initDb() {
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_withdrawals_address_created ON withdrawals(address, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_withdrawals_status_created ON withdrawals(status, created_at DESC);`);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawals_tx_signature_unique
+    ON withdrawals(tx_signature)
+    WHERE tx_signature IS NOT NULL;
+  `);
 
   // Greed deposit intents
   await pool.query(`
@@ -1111,7 +1116,7 @@ export async function findGreedDepositIntentByExactAmount(params: {
       AND status = $2
       AND expires_at > NOW()
     ORDER BY created_at ASC
-    LIMIT $1;
+    LIMIT 1;
     `,
     [exactAmount, status]
   );
@@ -1187,6 +1192,23 @@ export async function createWithdrawal(params: {
   return r.rows[0] || null;
 }
 
+export async function getPendingWithdrawals(limit = 20) {
+  const lim = Math.max(1, Math.min(100, Number(limit || 20)));
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM withdrawals
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT $1;
+    `,
+    [lim]
+  );
+
+  return r.rows || [];
+}
+
 export async function markWithdrawalProcessing(params: {
   withdrawalId: number;
   note?: string | null;
@@ -1234,6 +1256,7 @@ export async function markWithdrawalCompleted(params: {
       note = COALESCE($3, note),
       updated_at = NOW()
     WHERE id = $1
+      AND status = 'processing'
     RETURNING *;
     `,
     [withdrawalId, txSignature, note]
@@ -1259,6 +1282,7 @@ export async function markWithdrawalFailed(params: {
       note = COALESCE($2, note),
       updated_at = NOW()
     WHERE id = $1
+      AND status = 'processing'
     RETURNING *;
     `,
     [withdrawalId, note]
