@@ -15,7 +15,22 @@ const corsMod = await import("cors");
 const cors = corsMod.default;
 
 const solanaWeb3Mod = await import("@solana/web3.js");
-const { Connection, PublicKey, Keypair } = solanaWeb3Mod;
+const {
+  Connection,
+  PublicKey,
+  Keypair,
+  Transaction,
+  sendAndConfirmTransaction,
+  clusterApiUrl,
+} = solanaWeb3Mod;
+
+const splTokenMod = await import("@solana/spl-token");
+const {
+  getAssociatedTokenAddress,
+  createTransferInstruction,
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+} = splTokenMod;
 
 const authMod = await import("./auth.js");
 const authRouter = authMod.default;
@@ -40,6 +55,10 @@ const {
   hasDepositTxSignature,
   recordDeposit,
   createWithdrawal,
+  getPendingWithdrawals,
+  markWithdrawalProcessing,
+  markWithdrawalCompleted,
+  markWithdrawalFailed,
   recordGreedTaxLedger,
   getGreedJackpotState,
   setGreedJackpotAmount,
@@ -113,7 +132,9 @@ if (BANKROLL_PRIVATE_KEY) {
 
 // Solana watcher config
 const SOLANA_RPC_URL = String(
-  process.env.SOLANA_RPC_URL || process.env.RPC_URL || "https://api.mainnet-beta.solana.com"
+  process.env.SOLANA_RPC_URL ||
+    process.env.RPC_URL ||
+    clusterApiUrl("mainnet-beta")
 ).trim();
 
 const SOLANA_WATCH_ENABLED =
@@ -127,6 +148,20 @@ const SOLANA_WATCH_INTERVAL_MS = Math.max(
 const SOLANA_WATCH_SIGNATURE_LIMIT = Math.max(
   5,
   Math.min(50, Number(process.env.SOLANA_WATCH_SIGNATURE_LIMIT || 25))
+);
+
+// Withdrawal worker config
+const WITHDRAWALS_ENABLED =
+  String(process.env.WITHDRAWALS_ENABLED || "true").trim().toLowerCase() !== "false";
+
+const WITHDRAWALS_INTERVAL_MS = Math.max(
+  5000,
+  Math.min(120000, Number(process.env.WITHDRAWALS_INTERVAL_MS || 15000))
+);
+
+const WITHDRAWALS_BATCH_LIMIT = Math.max(
+  1,
+  Math.min(25, Number(process.env.WITHDRAWALS_BATCH_LIMIT || 5))
 );
 
 // Spectator / live loop config
@@ -176,6 +211,13 @@ let greedWatcherTimer: NodeJS.Timeout | null = null;
 let greedShoutTimer: NodeJS.Timeout | null = null;
 let greedWatcherBusy = false;
 let greedWatcherLastSeenSignature = "";
+
+let withdrawalsTimer: NodeJS.Timeout | null = null;
+let withdrawalsBusy = false;
+
+const solanaConnection = SOLANA_WATCH_ENABLED || WITHDRAWALS_ENABLED
+  ? new Connection(SOLANA_RPC_URL, "confirmed")
+  : null;
 
 function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
@@ -471,8 +513,6 @@ function startGreedShoutLoop() {
 // -------------------------------
 // Solana watcher helpers
 // -------------------------------
-const solanaConnection = SOLANA_WATCH_ENABLED ? new Connection(SOLANA_RPC_URL, "confirmed") : null;
-
 function extractAccountKeyStrings(tx: any): string[] {
   const keys = tx?.transaction?.message?.accountKeys || [];
   return keys.map((k: any) => {
@@ -700,6 +740,218 @@ function startGreedSolanaWatcher() {
   greedWatcherTimer = setInterval(() => {
     tickGreedSolanaWatcher().catch((e) => console.error("Watcher interval failed:", e));
   }, SOLANA_WATCH_INTERVAL_MS);
+}
+
+// -------------------------------
+// Withdrawal worker helpers
+// -------------------------------
+function isLikelySolanaAddress(value: string) {
+  const v = String(value || "").trim();
+  if (!v) return false;
+  if (v.startsWith("tg:")) return false;
+  if (v.length < 32 || v.length > 44) return false;
+  try {
+    new PublicKey(v);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function sendSplWithdrawal(params: {
+  destinationWallet: string;
+  amount: number;
+}) {
+  if (!solanaConnection) {
+    throw new Error("solana_connection_missing");
+  }
+  if (!bankrollKeypair) {
+    throw new Error("bankroll_signer_missing");
+  }
+  if (!PHAT_TOKEN_MINT || PHAT_TOKEN_MINT === "PHAT") {
+    throw new Error("invalid_phat_token_mint");
+  }
+
+  const mintPk = new PublicKey(PHAT_TOKEN_MINT);
+  const ownerPk = bankrollKeypair.publicKey;
+  const destinationOwnerPk = new PublicKey(params.destinationWallet);
+
+  const sourceAta = await getAssociatedTokenAddress(
+    mintPk,
+    ownerPk,
+    false,
+    TOKEN_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+
+  const destinationAta = await getAssociatedTokenAddress(
+    mintPk,
+    destinationOwnerPk,
+    false,
+    TOKEN_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+
+  const mintInfo = await solanaConnection.getParsedAccountInfo(mintPk, "confirmed");
+  const decimals =
+    Number((mintInfo.value?.data as any)?.parsed?.info?.decimals ?? 0) || 0;
+
+  const rawAmount = BigInt(Math.round(Number(params.amount) * 10 ** decimals));
+  if (rawAmount <= 0n) {
+    throw new Error("invalid_raw_amount");
+  }
+
+  const destinationAtaInfo = await solanaConnection.getAccountInfo(destinationAta, "confirmed");
+
+  const instructions: any[] = [];
+
+  if (!destinationAtaInfo) {
+    const createAtaIx = splTokenMod.createAssociatedTokenAccountInstruction(
+      ownerPk,
+      destinationAta,
+      destinationOwnerPk,
+      mintPk,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+    instructions.push(createAtaIx);
+  }
+
+  instructions.push(
+    createTransferInstruction(
+      sourceAta,
+      destinationAta,
+      ownerPk,
+      rawAmount,
+      [],
+      TOKEN_PROGRAM_ID
+    )
+  );
+
+  const latestBlockhash = await solanaConnection.getLatestBlockhash("confirmed");
+
+  const tx = new Transaction({
+    feePayer: ownerPk,
+    blockhash: latestBlockhash.blockhash,
+    lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+  });
+
+  tx.add(...instructions);
+
+  const signature = await sendAndConfirmTransaction(
+    solanaConnection,
+    tx,
+    [bankrollKeypair],
+    { commitment: "confirmed" }
+  );
+
+  return signature;
+}
+
+async function processPendingWithdrawalRow(withdrawal: any) {
+  const withdrawalId = Number(withdrawal?.id || 0);
+  const address = String(withdrawal?.address || "").trim();
+  const destinationWallet = String(withdrawal?.destination_wallet || "").trim();
+  const amount = Number(withdrawal?.amount || 0);
+
+  if (!withdrawalId || !address || !destinationWallet || amount <= 0) return;
+
+  const locked = await markWithdrawalProcessing({
+    withdrawalId,
+    note: "withdrawal worker claimed request",
+  });
+
+  if (!locked) return;
+
+  try {
+    if (!bankrollKeypair) {
+      throw new Error("bankroll_signer_missing");
+    }
+
+    if (!isLikelySolanaAddress(destinationWallet)) {
+      throw new Error("invalid_destination_wallet");
+    }
+
+    const txSignature = await sendSplWithdrawal({
+      destinationWallet,
+      amount,
+    });
+
+    const completed = await markWithdrawalCompleted({
+      withdrawalId,
+      txSignature,
+      note: "on-chain withdrawal completed",
+    });
+
+    console.log(
+      `✅ Withdrawal #${withdrawalId} completed for ${address} -> ${destinationWallet} amount ${formatAmount3(amount)} tx ${txSignature}`
+    );
+
+    return completed;
+  } catch (err: any) {
+    console.error(`❌ Withdrawal #${withdrawalId} failed:`, err);
+
+    await creditBalance({ address, amount });
+
+    await markWithdrawalFailed({
+      withdrawalId,
+      note: String(err?.message || "withdrawal failed; balance refunded"),
+    });
+
+    return null;
+  }
+}
+
+async function tickWithdrawalsWorker() {
+  if (!WITHDRAWALS_ENABLED) return;
+  if (withdrawalsBusy) return;
+
+  withdrawalsBusy = true;
+
+  try {
+    if (!bankrollKeypair) {
+      return;
+    }
+
+    const rows = await getPendingWithdrawals(WITHDRAWALS_BATCH_LIMIT);
+    if (!rows?.length) return;
+
+    for (const withdrawal of rows) {
+      await processPendingWithdrawalRow(withdrawal);
+    }
+  } catch (e) {
+    console.error("❌ Withdrawals worker tick failed:", e);
+  } finally {
+    withdrawalsBusy = false;
+  }
+}
+
+function startWithdrawalsWorker() {
+  if (!WITHDRAWALS_ENABLED) {
+    console.warn("⚠️ WITHDRAWALS_ENABLED=false. Withdrawal worker disabled.");
+    return;
+  }
+
+  if (!bankrollKeypair) {
+    console.warn("⚠️ No BANKROLL_PRIVATE_KEY signer loaded. Withdrawal worker disabled.");
+    return;
+  }
+
+  if (!PHAT_TOKEN_MINT || PHAT_TOKEN_MINT === "PHAT") {
+    console.warn("⚠️ PHAT_TOKEN_MINT is missing or placeholder. Withdrawal worker disabled.");
+    return;
+  }
+
+  console.log(`💸 Withdrawal worker enabled`);
+  console.log(`🏦 Bankroll wallet: ${bankrollWalletAddress}`);
+  console.log(`🪙 PHAT token mint: ${PHAT_TOKEN_MINT}`);
+  console.log(`⏱️ Withdrawal interval: ${WITHDRAWALS_INTERVAL_MS}ms`);
+
+  tickWithdrawalsWorker().catch((e) => console.error("Initial withdrawals tick failed:", e));
+
+  withdrawalsTimer = setInterval(() => {
+    tickWithdrawalsWorker().catch((e) => console.error("Withdrawals interval failed:", e));
+  }, WITHDRAWALS_INTERVAL_MS);
 }
 
 // -------------------------------
@@ -931,6 +1183,13 @@ app.get("/health", (_req: Request, res: Response) =>
       signerLoaded: !!bankrollKeypair,
       wallet: bankrollWalletAddress || null,
     },
+    withdrawals: {
+      enabled: WITHDRAWALS_ENABLED,
+      signerLoaded: !!bankrollKeypair,
+      intervalMs: WITHDRAWALS_INTERVAL_MS,
+      batchLimit: WITHDRAWALS_BATCH_LIMIT,
+      phatMint: PHAT_TOKEN_MINT || null,
+    },
     spectator: {
       enabled: GREED_SPECTATOR_ENABLED,
       chatId: GREED_SPECTATOR_CHAT_ID || null,
@@ -976,6 +1235,11 @@ app.get("/wallet/deposit-info", requireAuth, async (_req: Request, res: Response
       intervalMs: SOLANA_WATCH_INTERVAL_MS,
       watcherTarget: PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET || null,
     },
+    withdrawals: {
+      enabled: WITHDRAWALS_ENABLED,
+      signerLoaded: !!bankrollKeypair,
+      payoutWallet: bankrollWalletAddress || null,
+    },
   });
 });
 
@@ -987,6 +1251,10 @@ app.post("/wallet/withdraw", requireAuth, async (req: Request, res: Response) =>
 
     if (amount == null || amount <= 0) {
       return res.status(400).json({ error: "Invalid amount" });
+    }
+
+    if (!destinationWallet) {
+      return res.status(400).json({ error: "Missing destination wallet" });
     }
 
     const bal = await getBalance(address);
@@ -2432,6 +2700,7 @@ try {
   }
 
   startGreedSolanaWatcher();
+  startWithdrawalsWorker();
   startGreedShoutLoop();
 
   app.listen(PORT, () => console.log(`✅ Planet Fatness backend on :${PORT}`));
