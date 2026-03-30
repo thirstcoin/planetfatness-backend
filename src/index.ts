@@ -28,7 +28,10 @@ const splTokenMod = await import("@solana/spl-token");
 const {
   getAssociatedTokenAddress,
   createTransferInstruction,
+  createAssociatedTokenAccountInstruction,
+  getMint,
   TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } = splTokenMod;
 
@@ -776,11 +779,29 @@ async function sendSplWithdrawal(params: {
   const ownerPk = bankrollKeypair.publicKey;
   const destinationOwnerPk = new PublicKey(params.destinationWallet);
 
+  let tokenProgramId = TOKEN_PROGRAM_ID;
+  let mintInfo: any = null;
+
+  try {
+    mintInfo = await getMint(solanaConnection, mintPk, "confirmed", TOKEN_PROGRAM_ID);
+    tokenProgramId = TOKEN_PROGRAM_ID;
+  } catch {
+    mintInfo = await getMint(solanaConnection, mintPk, "confirmed", TOKEN_2022_PROGRAM_ID);
+    tokenProgramId = TOKEN_2022_PROGRAM_ID;
+  }
+
+  const decimals = Number(mintInfo?.decimals ?? 0);
+  const rawAmount = BigInt(Math.round(Number(params.amount) * 10 ** decimals));
+
+  if (rawAmount <= 0n) {
+    throw new Error("invalid_raw_amount");
+  }
+
   const sourceAta = await getAssociatedTokenAddress(
     mintPk,
     ownerPk,
     false,
-    TOKEN_PROGRAM_ID,
+    tokenProgramId,
     ASSOCIATED_TOKEN_PROGRAM_ID
   );
 
@@ -788,33 +809,25 @@ async function sendSplWithdrawal(params: {
     mintPk,
     destinationOwnerPk,
     false,
-    TOKEN_PROGRAM_ID,
+    tokenProgramId,
     ASSOCIATED_TOKEN_PROGRAM_ID
   );
-
-  const mintInfo = await solanaConnection.getParsedAccountInfo(mintPk, "confirmed");
-  const decimals =
-    Number((mintInfo.value?.data as any)?.parsed?.info?.decimals ?? 0) || 0;
-
-  const rawAmount = BigInt(Math.round(Number(params.amount) * 10 ** decimals));
-  if (rawAmount <= 0n) {
-    throw new Error("invalid_raw_amount");
-  }
 
   const destinationAtaInfo = await solanaConnection.getAccountInfo(destinationAta, "confirmed");
 
   const instructions: any[] = [];
 
   if (!destinationAtaInfo) {
-    const createAtaIx = splTokenMod.createAssociatedTokenAccountInstruction(
-      ownerPk,
-      destinationAta,
-      destinationOwnerPk,
-      mintPk,
-      TOKEN_PROGRAM_ID,
-      ASSOCIATED_TOKEN_PROGRAM_ID
+    instructions.push(
+      createAssociatedTokenAccountInstruction(
+        ownerPk,
+        destinationAta,
+        destinationOwnerPk,
+        mintPk,
+        tokenProgramId,
+        ASSOCIATED_TOKEN_PROGRAM_ID
+      )
     );
-    instructions.push(createAtaIx);
   }
 
   instructions.push(
@@ -824,7 +837,7 @@ async function sendSplWithdrawal(params: {
       ownerPk,
       rawAmount,
       [],
-      TOKEN_PROGRAM_ID
+      tokenProgramId
     )
   );
 
