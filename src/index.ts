@@ -5,6 +5,7 @@ import type { Request, Response } from "express";
 import { Telegraf, Markup } from "telegraf";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
+import bs58 from "bs58";
 
 // --- Dynamic imports (env ready before db.ts reads DATABASE_URL) ---
 const expressMod = await import("express");
@@ -14,7 +15,7 @@ const corsMod = await import("cors");
 const cors = corsMod.default;
 
 const solanaWeb3Mod = await import("@solana/web3.js");
-const { Connection, PublicKey } = solanaWeb3Mod;
+const { Connection, PublicKey, Keypair } = solanaWeb3Mod;
 
 const authMod = await import("./auth.js");
 const authRouter = authMod.default;
@@ -85,6 +86,30 @@ const GREED_INTENT_EXPIRES_MINUTES = Math.max(
   1,
   Math.min(60, Number(process.env.GREED_INTENT_EXPIRES_MINUTES || 10))
 );
+
+// Bankroll wallet config
+const BANKROLL_PRIVATE_KEY = String(process.env.BANKROLL_PRIVATE_KEY || "").trim();
+const BANKROLL_WALLET_ENV = String(process.env.BANKROLL_WALLET || "").trim();
+
+let bankrollKeypair: InstanceType<typeof Keypair> | null = null;
+let bankrollWalletAddress: string | null = null;
+
+if (BANKROLL_PRIVATE_KEY) {
+  try {
+    const decoded = bs58.decode(BANKROLL_PRIVATE_KEY);
+    bankrollKeypair = Keypair.fromSecretKey(decoded);
+    bankrollWalletAddress = bankrollKeypair.publicKey.toBase58();
+    console.log(`🏦 Bankroll wallet loaded: ${bankrollWalletAddress}`);
+  } catch (e) {
+    console.error("❌ Invalid BANKROLL_PRIVATE_KEY. Could not decode base58 private key.", e);
+    process.exit(1);
+  }
+} else if (BANKROLL_WALLET_ENV) {
+  bankrollWalletAddress = BANKROLL_WALLET_ENV;
+  console.warn("⚠️ BANKROLL_PRIVATE_KEY missing. Bankroll wallet loaded in read-only/address-only mode.");
+} else {
+  console.warn("⚠️ No bankroll wallet configured yet (BANKROLL_PRIVATE_KEY / BANKROLL_WALLET missing).");
+}
 
 // Solana watcher config
 const SOLANA_RPC_URL = String(
@@ -901,6 +926,11 @@ app.get("/health", (_req: Request, res: Response) =>
       intervalMs: SOLANA_WATCH_INTERVAL_MS,
       lastSeenSignature: greedWatcherLastSeenSignature || null,
     },
+    bankroll: {
+      configured: !!bankrollWalletAddress,
+      signerLoaded: !!bankrollKeypair,
+      wallet: bankrollWalletAddress || null,
+    },
     spectator: {
       enabled: GREED_SPECTATOR_ENABLED,
       chatId: GREED_SPECTATOR_CHAT_ID || null,
@@ -935,11 +965,12 @@ app.get("/wallet/deposit-info", requireAuth, async (_req: Request, res: Response
   return res.json({
     ok: true,
     depositWallet: DEPOSIT_WALLET || null,
-    bankrollWallet: String(process.env.BANKROLL_WALLET || "").trim() || null,
+    bankrollWallet: bankrollWalletAddress || null,
     jackpotWallet: String(process.env.JACKPOT_WALLET || "").trim() || null,
     treasuryWallet: String(process.env.TREASURY_WALLET || "").trim() || null,
     acceptedToken: PHAT_TOKEN_MINT,
     mode: "intent-funding",
+    bankrollSignerLoaded: !!bankrollKeypair,
     watcher: {
       enabled: SOLANA_WATCH_ENABLED,
       intervalMs: SOLANA_WATCH_INTERVAL_MS,
@@ -979,6 +1010,8 @@ app.post("/wallet/withdraw", requireAuth, async (req: Request, res: Response) =>
     return res.json({
       ok: true,
       withdrawal: row,
+      payoutWalletReady: !!bankrollKeypair,
+      payoutWallet: bankrollWalletAddress || null,
     });
   } catch (e) {
     console.error(e);
