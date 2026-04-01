@@ -86,7 +86,10 @@ const {
   cancelGreedDepositIntent,
   consumeFundedGreedDepositIntent,
   markGreedDepositIntentFunded,
-  findGreedDepositIntentByExactAmount,
+  recordGreedUnmatchedDeposit,
+  getGreedUnmatchedDepositBySignature,
+  getOpenGreedUnmatchedDeposits,
+  markGreedUnmatchedDepositResolved,
 } = dbMod;
 
 // -------------------------------
@@ -311,6 +314,26 @@ function serializeGreedIntent(row: any) {
   };
 }
 
+function serializeUnmatchedDeposit(row: any) {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    txSignature: row.tx_signature,
+    senderWallet: row.sender_wallet || null,
+    tokenMint: row.token_mint || null,
+    observedAmount: Number(row.observed_amount || 0),
+    watcherTarget: row.watcher_target || null,
+    matchedIntentId: row.matched_intent_id == null ? null : Number(row.matched_intent_id),
+    matchedAddress: row.matched_address || null,
+    reason: row.reason || null,
+    resolutionStatus: row.resolution_status || null,
+    resolutionNote: row.resolution_note || null,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    resolvedAt: row.resolved_at || null,
+  };
+}
+
 function maskAddress(address: string) {
   const a = String(address || "").trim();
   if (!a) return "Unknown";
@@ -388,6 +411,40 @@ async function generateUniqueExactAmount(requestedWager: number) {
   }
 
   throw new Error("Could not generate unique exact funding amount");
+}
+
+async function findGreedIntentByExactAmountLocal(params: {
+  exactAmount: number | string;
+  status?: "pending" | "funded";
+}) {
+  const exactAmount = formatAmount3(params.exactAmount);
+  const status = String(params.status || "pending").trim();
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM greed_deposit_intents
+    WHERE exact_amount = $1::numeric
+      AND status = $2
+      AND expires_at > NOW()
+    ORDER BY created_at ASC
+    LIMIT 1;
+    `,
+    [exactAmount, status]
+  );
+
+  return r.rows[0] || null;
+}
+
+async function getOpenUnmatchedDepositCount() {
+  const r = await pool.query(
+    `
+    SELECT COUNT(*)::INT AS count
+    FROM greed_unmatched_deposits
+    WHERE resolution_status = 'open';
+    `
+  );
+  return Number(r.rows?.[0]?.count || 0);
 }
 
 function getSpectatorChatIdFromReq(req: Request) {
@@ -629,6 +686,11 @@ async function processSolanaDepositSignature(signature: string) {
   const alreadyProcessed = await hasDepositTxSignature(signature);
   if (alreadyProcessed) return;
 
+  const alreadyLoggedUnmatched = await getGreedUnmatchedDepositBySignature(signature);
+  if (alreadyLoggedUnmatched && String(alreadyLoggedUnmatched.resolution_status || "") === "open") {
+    return;
+  }
+
   if (!solanaConnection) return;
 
   const parsedTx = await solanaConnection.getParsedTransaction(signature, {
@@ -642,12 +704,30 @@ async function processSolanaDepositSignature(signature: string) {
   if (!observed.exactAmount || observed.exactAmount <= 0) return;
 
   const exactAmount = Number(formatAmount3(observed.exactAmount));
-  const matchingIntent = await findGreedDepositIntentByExactAmount({
+  const watcherTarget = PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET || null;
+
+  const matchingIntent = await findGreedIntentByExactAmountLocal({
     exactAmount,
     status: "pending",
   });
 
-  if (!matchingIntent) return;
+  if (!matchingIntent) {
+    await recordGreedUnmatchedDeposit({
+      txSignature: signature,
+      senderWallet: observed.senderWallet,
+      tokenMint: observed.tokenMint || PHAT_TOKEN_MINT,
+      observedAmount: exactAmount,
+      watcherTarget,
+      reason: "no_matching_pending_intent",
+      resolutionStatus: "open",
+      resolutionNote: "deposit observed but no pending intent matched this exact amount",
+    });
+
+    console.warn(
+      `⚠️ Unmatched Greed deposit observed: sig=${signature} amount=${formatAmount3(exactAmount)} sender=${observed.senderWallet || "unknown"}`
+    );
+    return;
+  }
 
   const funded = await markGreedDepositIntentFunded({
     id: Number(matchingIntent.id),
@@ -657,9 +737,27 @@ async function processSolanaDepositSignature(signature: string) {
     tokenMint: observed.tokenMint || PHAT_TOKEN_MINT,
   });
 
-  if (!funded) return;
+  if (!funded) {
+    await recordGreedUnmatchedDeposit({
+      txSignature: signature,
+      senderWallet: observed.senderWallet,
+      tokenMint: observed.tokenMint || PHAT_TOKEN_MINT,
+      observedAmount: exactAmount,
+      watcherTarget,
+      matchedIntentId: Number(matchingIntent.id),
+      matchedAddress: String(matchingIntent.address),
+      reason: "intent_match_claim_failed",
+      resolutionStatus: "open",
+      resolutionNote: "matching intent was found but could not be marked funded",
+    });
 
-  await recordDeposit({
+    console.warn(
+      `⚠️ Greed deposit matched amount but funding claim failed: sig=${signature} intent=${matchingIntent.id} amount=${formatAmount3(exactAmount)}`
+    );
+    return;
+  }
+
+  const dep = await recordDeposit({
     address: String(funded.address),
     txSignature: signature,
     senderWallet: observed.senderWallet,
@@ -668,6 +766,21 @@ async function processSolanaDepositSignature(signature: string) {
     status: "credited",
     note: "greed intent funded by watcher",
   });
+
+  if (!dep) {
+    console.warn(`⚠️ Deposit record already existed after funding intent for tx ${signature}`);
+  }
+
+  const existingUnmatched = await getGreedUnmatchedDepositBySignature(signature);
+  if (existingUnmatched && String(existingUnmatched.resolution_status || "") === "open") {
+    await markGreedUnmatchedDepositResolved({
+      txSignature: signature,
+      resolutionStatus: "resolved",
+      resolutionNote: "deposit later matched and funded successfully",
+      matchedIntentId: Number(funded.id),
+      matchedAddress: String(funded.address),
+    });
+  }
 
   console.log(
     `✅ Greed watcher funded intent #${funded.id} for ${funded.address} with ${formatAmount3(
@@ -1176,7 +1289,7 @@ app.get("/", (_req: Request, res: Response) => {
     );
 });
 
-app.get("/health", (_req: Request, res: Response) =>
+app.get("/health", async (_req: Request, res: Response) =>
   res.json({
     ok: true,
     service: "planetfatness-backend",
@@ -1190,6 +1303,7 @@ app.get("/health", (_req: Request, res: Response) =>
       rpc: SOLANA_RPC_URL || null,
       intervalMs: SOLANA_WATCH_INTERVAL_MS,
       lastSeenSignature: greedWatcherLastSeenSignature || null,
+      openUnmatchedCount: await getOpenUnmatchedDepositCount(),
     },
     bankroll: {
       configured: !!bankrollWalletAddress,
@@ -2436,7 +2550,7 @@ app.post("/admin/greed/fund-intent", async (req: Request, res: Response) => {
       if (exactAmount == null) {
         return res.status(400).json({ error: "Missing exactAmount" });
       }
-      intent = await findGreedDepositIntentByExactAmount({
+      intent = await findGreedIntentByExactAmountLocal({
         exactAmount,
         status: "pending",
       });
@@ -2477,6 +2591,17 @@ app.post("/admin/greed/fund-intent", async (req: Request, res: Response) => {
       note: "greed intent funded",
     });
 
+    const existingUnmatched = await getGreedUnmatchedDepositBySignature(txSignature);
+    if (existingUnmatched && String(existingUnmatched.resolution_status || "") === "open") {
+      await markGreedUnmatchedDepositResolved({
+        txSignature,
+        resolutionStatus: "resolved",
+        resolutionNote: "admin matched this deposit to a valid intent",
+        matchedIntentId: Number(funded.id),
+        matchedAddress: String(funded.address),
+      });
+    }
+
     return res.json({
       ok: true,
       intent: serializeGreedIntent(funded),
@@ -2485,6 +2610,60 @@ app.post("/admin/greed/fund-intent", async (req: Request, res: Response) => {
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Fund intent failed" });
+  }
+});
+
+app.get("/admin/greed/unmatched", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
+    const rows = await getOpenGreedUnmatchedDeposits(limit);
+    return res.json({
+      ok: true,
+      count: rows.length,
+      rows: rows.map(serializeUnmatchedDeposit),
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch unmatched deposits" });
+  }
+});
+
+app.post("/admin/greed/unmatched/resolve", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const txSignature = String(req.body?.txSignature || "").trim();
+    const resolutionStatus = String(req.body?.resolutionStatus || "resolved").trim() || "resolved";
+    const resolutionNote = String(req.body?.resolutionNote || "").trim() || null;
+    const matchedIntentId =
+      req.body?.matchedIntentId == null ? null : Math.floor(Number(req.body.matchedIntentId || 0)) || null;
+    const matchedAddress = String(req.body?.matchedAddress || "").trim() || null;
+
+    if (!txSignature) {
+      return res.status(400).json({ error: "Missing txSignature" });
+    }
+
+    const row = await markGreedUnmatchedDepositResolved({
+      txSignature,
+      resolutionStatus,
+      resolutionNote,
+      matchedIntentId,
+      matchedAddress,
+    });
+
+    if (!row) {
+      return res.status(404).json({ error: "Unmatched deposit not found" });
+    }
+
+    return res.json({
+      ok: true,
+      row: serializeUnmatchedDeposit(row),
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to resolve unmatched deposit" });
   }
 });
 
@@ -2517,6 +2696,7 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
     await pool.query(`TRUNCATE TABLE greed_picks CASCADE;`);
     await pool.query(`TRUNCATE TABLE greed_rounds CASCADE;`);
     await pool.query(`TRUNCATE TABLE greed_deposit_intents CASCADE;`);
+    await pool.query(`TRUNCATE TABLE greed_unmatched_deposits CASCADE;`);
     await pool.query(`TRUNCATE TABLE deposits CASCADE;`);
     await pool.query(`TRUNCATE TABLE withdrawals CASCADE;`);
     await pool.query(`TRUNCATE TABLE greed_tax_ledger CASCADE;`);
