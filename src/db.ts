@@ -290,6 +290,51 @@ export async function initDb() {
     WHERE status IN ('pending', 'funded');
   `);
 
+  // Unmatched / wrong-amount / orphan deposit tracking
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS greed_unmatched_deposits (
+      id BIGSERIAL PRIMARY KEY,
+      tx_signature TEXT NOT NULL UNIQUE,
+      sender_wallet TEXT,
+      token_mint TEXT,
+      observed_amount NUMERIC(18,3) NOT NULL DEFAULT 0,
+      watcher_target TEXT,
+      matched_intent_id BIGINT REFERENCES greed_deposit_intents(id) ON DELETE SET NULL,
+      matched_address TEXT REFERENCES users(address) ON DELETE SET NULL,
+      reason TEXT NOT NULL DEFAULT 'unmatched',
+      resolution_status TEXT NOT NULL DEFAULT 'open',
+      resolution_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      resolved_at TIMESTAMPTZ
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE greed_unmatched_deposits
+    ADD COLUMN IF NOT EXISTS sender_wallet TEXT,
+    ADD COLUMN IF NOT EXISTS token_mint TEXT,
+    ADD COLUMN IF NOT EXISTS observed_amount NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS watcher_target TEXT,
+    ADD COLUMN IF NOT EXISTS matched_intent_id BIGINT REFERENCES greed_deposit_intents(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS matched_address TEXT REFERENCES users(address) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT 'unmatched',
+    ADD COLUMN IF NOT EXISTS resolution_status TEXT NOT NULL DEFAULT 'open',
+    ADD COLUMN IF NOT EXISTS resolution_note TEXT,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+  `);
+
+  await pool.query(`
+    ALTER TABLE greed_unmatched_deposits
+    ALTER COLUMN observed_amount TYPE NUMERIC(18,3) USING (observed_amount::numeric);
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_unmatched_created ON greed_unmatched_deposits(created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_unmatched_sender_wallet ON greed_unmatched_deposits(sender_wallet);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_unmatched_resolution_status ON greed_unmatched_deposits(resolution_status, created_at DESC);`);
+
   // Jackpot state
   await pool.query(`
     CREATE TABLE IF NOT EXISTS jackpot_state (
@@ -354,7 +399,7 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_tax_ledger_address_created ON greed_tax_ledger(address, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_tax_ledger_round_id ON greed_tax_ledger(round_id);`);
 
-  console.log("✅ DB ready (TG + games + Greed + balances + deposits + withdrawals + deposit intents + jackpot + tax ledger)");
+  console.log("✅ DB ready (TG + games + Greed + balances + deposits + withdrawals + deposit intents + unmatched deposits + jackpot + tax ledger)");
 }
 
 // -------------------------------
@@ -1116,7 +1161,7 @@ export async function findGreedDepositIntentByExactAmount(params: {
       AND status = $2
       AND expires_at > NOW()
     ORDER BY created_at ASC
-    LIMIT 1;
+    LIMIT $1;
     `,
     [exactAmount, status]
   );
@@ -1147,6 +1192,153 @@ export async function consumeFundedGreedDepositIntent(params: {
     RETURNING *;
     `,
     [id, address]
+  );
+
+  return r.rows[0] || null;
+}
+
+// -------------------------------
+// Unmatched deposit helpers
+// -------------------------------
+export async function recordGreedUnmatchedDeposit(params: {
+  txSignature: string;
+  senderWallet?: string | null;
+  tokenMint?: string | null;
+  observedAmount: number | string;
+  watcherTarget?: string | null;
+  matchedIntentId?: number | null;
+  matchedAddress?: string | null;
+  reason?: string;
+  resolutionStatus?: string;
+  resolutionNote?: string | null;
+}) {
+  const txSignature = String(params.txSignature || "").trim();
+  const senderWallet = params.senderWallet ? String(params.senderWallet).trim() : null;
+  const tokenMint = params.tokenMint ? String(params.tokenMint).trim() : null;
+  const observedAmount = asAmount(params.observedAmount);
+  const watcherTarget = params.watcherTarget ? String(params.watcherTarget).trim() : null;
+  const matchedIntentId =
+    params.matchedIntentId == null ? null : Math.max(0, Math.floor(Number(params.matchedIntentId || 0))) || null;
+  const matchedAddress = params.matchedAddress ? String(params.matchedAddress).trim() : null;
+  const reason = String(params.reason || "unmatched").trim().slice(0, 80) || "unmatched";
+  const resolutionStatus = String(params.resolutionStatus || "open").trim().slice(0, 40) || "open";
+  const resolutionNote = params.resolutionNote ? String(params.resolutionNote).trim() : null;
+
+  if (!txSignature) throw new Error("missing txSignature");
+  if (Number(observedAmount) <= 0) throw new Error("invalid observedAmount");
+
+  const r = await pool.query(
+    `
+    INSERT INTO greed_unmatched_deposits (
+      tx_signature,
+      sender_wallet,
+      token_mint,
+      observed_amount,
+      watcher_target,
+      matched_intent_id,
+      matched_address,
+      reason,
+      resolution_status,
+      resolution_note,
+      created_at,
+      updated_at
+    )
+    VALUES ($1,$2,$3,$4::numeric,$5,$6,$7,$8,$9,$10,NOW(),NOW())
+    ON CONFLICT (tx_signature) DO UPDATE
+    SET
+      sender_wallet = COALESCE(EXCLUDED.sender_wallet, greed_unmatched_deposits.sender_wallet),
+      token_mint = COALESCE(EXCLUDED.token_mint, greed_unmatched_deposits.token_mint),
+      observed_amount = EXCLUDED.observed_amount,
+      watcher_target = COALESCE(EXCLUDED.watcher_target, greed_unmatched_deposits.watcher_target),
+      matched_intent_id = COALESCE(EXCLUDED.matched_intent_id, greed_unmatched_deposits.matched_intent_id),
+      matched_address = COALESCE(EXCLUDED.matched_address, greed_unmatched_deposits.matched_address),
+      reason = EXCLUDED.reason,
+      resolution_status = EXCLUDED.resolution_status,
+      resolution_note = COALESCE(EXCLUDED.resolution_note, greed_unmatched_deposits.resolution_note),
+      updated_at = NOW()
+    RETURNING *;
+    `,
+    [
+      txSignature,
+      senderWallet,
+      tokenMint,
+      observedAmount,
+      watcherTarget,
+      matchedIntentId,
+      matchedAddress,
+      reason,
+      resolutionStatus,
+      resolutionNote,
+    ]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function getGreedUnmatchedDepositBySignature(txSignature: string) {
+  const sig = String(txSignature || "").trim();
+  if (!sig) throw new Error("missing txSignature");
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM greed_unmatched_deposits
+    WHERE tx_signature = $1
+    LIMIT 1;
+    `,
+    [sig]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function getOpenGreedUnmatchedDeposits(limit = 50) {
+  const lim = Math.max(1, Math.min(200, Number(limit || 50)));
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM greed_unmatched_deposits
+    WHERE resolution_status = 'open'
+    ORDER BY created_at DESC
+    LIMIT $1;
+    `,
+    [lim]
+  );
+
+  return r.rows || [];
+}
+
+export async function markGreedUnmatchedDepositResolved(params: {
+  txSignature: string;
+  resolutionStatus?: string;
+  resolutionNote?: string | null;
+  matchedIntentId?: number | null;
+  matchedAddress?: string | null;
+}) {
+  const txSignature = String(params.txSignature || "").trim();
+  const resolutionStatus = String(params.resolutionStatus || "resolved").trim().slice(0, 40) || "resolved";
+  const resolutionNote = params.resolutionNote ? String(params.resolutionNote).trim() : null;
+  const matchedIntentId =
+    params.matchedIntentId == null ? null : Math.max(0, Math.floor(Number(params.matchedIntentId || 0))) || null;
+  const matchedAddress = params.matchedAddress ? String(params.matchedAddress).trim() : null;
+
+  if (!txSignature) throw new Error("missing txSignature");
+
+  const r = await pool.query(
+    `
+    UPDATE greed_unmatched_deposits
+    SET
+      resolution_status = $2,
+      resolution_note = COALESCE($3, resolution_note),
+      matched_intent_id = COALESCE($4, matched_intent_id),
+      matched_address = COALESCE($5, matched_address),
+      updated_at = NOW(),
+      resolved_at = NOW()
+    WHERE tx_signature = $1
+    RETURNING *;
+    `,
+    [txSignature, resolutionStatus, resolutionNote, matchedIntentId, matchedAddress]
   );
 
   return r.rows[0] || null;
