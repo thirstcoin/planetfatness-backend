@@ -950,7 +950,6 @@ export async function recordDeposit(params: {
 
   return r.rows[0] || null;
 }
-
 // -------------------------------
 // Greed deposit intent helpers
 // -------------------------------
@@ -1161,7 +1160,7 @@ export async function findGreedDepositIntentByExactAmount(params: {
       AND status = $2
       AND expires_at > NOW()
     ORDER BY created_at ASC
-    LIMIT $1;
+    LIMIT 1;
     `,
     [exactAmount, status]
   );
