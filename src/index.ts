@@ -2267,293 +2267,154 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
         });
       }
 
-      const intentWager = Number(openIntent.requested_wager || 0);
-      const exactAmount = round3(Number(openIntent.exact_amount || 0));
+    const intentWager = Number(openIntent.requested_wager || 0);
+    const exactAmount = round3(Number(openIntent.exact_amount || 0));
 
-      if (intentWager !== requestedWager) {
-        return res.status(400).json({
-          error: "Wager does not match funded intent",
-          code: "INTENT_WAGER_MISMATCH",
-          intent: serializeGreedIntent(openIntent),
-        });
-      }
-
-      const consumedIntent = await consumeFundedGreedDepositIntent({
-        id: Number(openIntent.id),
-        address,
+    if (intentWager !== requestedWager) {
+      return res.status(400).json({
+        error: "Wager does not match funded intent",
+        code: "INTENT_WAGER_MISMATCH",
+        intent: serializeGreedIntent(openIntent),
       });
-
-      if (!consumedIntent) {
-        return res.status(409).json({
-          error: "Funded intent could not be consumed",
-          code: "INTENT_CONSUME_FAILED",
-        });
-      }
-
-      await creditBalance({ address, amount: exactAmount });
-
-      const debited = await debitBalance({ address, amount: exactAmount });
-      if (!debited) {
-        return res.status(409).json({
-          error: "Failed to lock funded wager",
-          code: "FUNDED_WAGER_LOCK_FAILED",
-        });
-      }
-
-      lockedWager = round3(exactAmount);
-      fundedIntentId = Number(consumedIntent.id);
-      fundingSource = "intent";
     }
 
-    const { totalTax, devCut, treasuryCut, jackpotCut, netStake } =
-      getGreedTaxBreakdown(lockedWager);
+    const consumedIntent = await consumeFundedGreedDepositIntent({
+      id: Number(openIntent.id),
+      address,
+    });
 
-    const jackpotFeed = round3(lockedWager * GREED_JACKPOT_FEED_RATE);
-    await addToGreedJackpot(jackpotFeed);
+    if (!consumedIntent) {
+      return res.status(409).json({
+        error: "Funded intent could not be consumed",
+        code: "INTENT_CONSUME_FAILED",
+      });
+    }
 
-    const serverSeed = crypto.randomBytes(32).toString("hex");
-    const commitHash = sha256Hex(serverSeed);
-    const nonce = Date.now();
-    const poisonIndices = derivePoisonIndicesFromSeed(
-      serverSeed,
-      nonce,
-      GREED_TOTAL_DONUTS,
-      GREED_POISON_COUNT
+    await creditBalance({ address, amount: exactAmount });
+
+    const debited = await debitBalance({ address, amount: exactAmount });
+    if (!debited) {
+      return res.status(409).json({
+        error: "Failed to lock funded wager",
+        code: "FUNDED_WAGER_LOCK_FAILED",
+      });
+    }
+
+    lockedWager = round3(exactAmount);
+    fundedIntentId = Number(consumedIntent.id);
+    fundingSource = "intent";
+  }
+
+  const { totalTax, devCut, treasuryCut, jackpotCut, netStake } =
+    getGreedTaxBreakdown(lockedWager);
+
+  const jackpotFeed = round3(lockedWager * GREED_JACKPOT_FEED_RATE);
+  await addToGreedJackpot(jackpotFeed);
+
+  const serverSeed = crypto.randomBytes(32).toString("hex");
+  const commitHash = sha256Hex(serverSeed);
+  const nonce = Date.now();
+  const poisonIndices = derivePoisonIndicesFromSeed(
+    serverSeed,
+    nonce,
+    GREED_TOTAL_DONUTS,
+    GREED_POISON_COUNT
+  );
+
+  const round = await createGreedRound({
+    address,
+    wager: lockedWager,
+    netStake,
+    poisonIndices,
+    seed: serverSeed,
+    commitHash,
+    nonce,
+  });
+
+  await recordGreedTaxLedger({
+    address,
+    roundId: Number(round.id),
+    source:
+      fundingSource === "balance"
+        ? "greed_start_balance"
+        : "greed_start_intent",
+    grossWager: lockedWager,
+    totalTax,
+    devCut,
+    treasuryCut,
+    jackpotCut,
+    note:
+      fundingSource === "balance"
+        ? "greed round started from internal balance"
+        : `greed round started from funded intent${
+            fundedIntentId ? ` #${fundedIntentId}` : ""
+          }`,
+  });
+
+  const displayName = await getDisplayNameForAddress(address);
+
+  if (GREED_SPECTATOR_ENABLED && spectatorChatId) {
+    registerLiveRound({
+      roundId: Number(round.id),
+      address,
+      displayName,
+      wager: requestedWager,
+      fundedExactAmount: lockedWager,
+      chatId: spectatorChatId,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      safeClicks: 0,
+      isActive: true,
+    });
+
+    await sendGymSpectatorMessageToChat(
+      spectatorChatId,
+      [
+        `🍩 FEED YOUR GREED LIVE`,
+        ``,
+        `${displayName} just locked a round.`,
+        `Requested wager: ${formatAmount3(requestedWager)} PHAT`,
+        `Locked amount: ${formatAmount3(lockedWager)} PHAT`,
+        `Round ID: #${Number(round.id)}`,
+        ``,
+        `Pick your donut in chat before they do 👇`,
+        `${formatDonutBoardLine()}`,
+      ].join("\n"),
+      {
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+        ]).reply_markup,
+      }
     );
+  }
 
-    const round = await createGreedRound({
-      address,
-      wager: lockedWager,
-      netStake,
-      poisonIndices,
-      seed: serverSeed,
+  return res.json({
+    ok: true,
+    roundId: round.id,
+    requestedWager,
+    fundedExactAmount: lockedWager,
+    wager: lockedWager,
+    netStake,
+    totalTax,
+    devCut,
+    treasuryCut,
+    jackpotCut,
+    jackpotFeed,
+    fundingSource,
+    totalDonuts: GREED_TOTAL_DONUTS,
+    poisonCount: GREED_POISON_COUNT,
+    currentMultiplier: 1.0,
+    cashoutAvailable: false,
+    fundedIntentId,
+    provablyFair: {
       commitHash,
       nonce,
-    });
-
-    await recordGreedTaxLedger({
-      address,
-      roundId: Number(round.id),
-      source:
-        fundingSource === "balance"
-          ? "greed_start_balance"
-          : "greed_start_intent",
-      grossWager: lockedWager,
-      totalTax,
-      devCut,
-      treasuryCut,
-      jackpotCut,
-      note:
-        fundingSource === "balance"
-          ? "greed round started from internal balance"
-          : `greed round started from funded intent${
-              fundedIntentId ? ` #${fundedIntentId}` : ""
-            }`,
-    });
-
-    const displayName = await getDisplayNameForAddress(address);
-
-    if (GREED_SPECTATOR_ENABLED && spectatorChatId) {
-      registerLiveRound({
-        roundId: Number(round.id),
-        address,
-        displayName,
-        wager: requestedWager,
-        fundedExactAmount: lockedWager,
-        chatId: spectatorChatId,
-        startedAt: Date.now(),
-        updatedAt: Date.now(),
-        safeClicks: 0,
-        isActive: true,
-      });
-
-      await sendGymSpectatorMessageToChat(
-        spectatorChatId,
-        [
-          `🍩 FEED YOUR GREED LIVE`,
-          ``,
-          `${displayName} just locked a round.`,
-          `Requested wager: ${formatAmount3(requestedWager)} PHAT`,
-          `Locked amount: ${formatAmount3(lockedWager)} PHAT`,
-          `Round ID: #${Number(round.id)}`,
-          ``,
-          `Pick your donut in chat before they do 👇`,
-          `${formatDonutBoardLine()}`,
-        ].join("\n"),
-        {
-          reply_markup: Markup.inlineKeyboard([
-            [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-          ]).reply_markup,
-        }
-      );
-    }
-
-    return res.json({
-      ok: true,
-      roundId: round.id,
-      requestedWager,
-      fundedExactAmount: lockedWager,
-      wager: lockedWager,
-      netStake,
-      totalTax,
-      devCut,
-      treasuryCut,
-      jackpotCut,
-      jackpotFeed,
-      fundingSource,
-      totalDonuts: GREED_TOTAL_DONUTS,
-      poisonCount: GREED_POISON_COUNT,
-      currentMultiplier: 1.0,
-      cashoutAvailable: false,
-      fundedIntentId,
-      provablyFair: {
-        commitHash,
-        nonce,
-      },
-    });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Failed to start greed round" });
-  }
-});
-
-      const intentWager = Number(openIntent.requested_wager || 0);
-      const exactAmount = round3(Number(openIntent.exact_amount || 0));
-
-      if (intentWager !== requestedWager) {
-        return res.status(400).json({
-          error: "Wager does not match funded intent",
-          code: "INTENT_WAGER_MISMATCH",
-          intent: serializeGreedIntent(openIntent),
-        });
-      }
-
-      const consumedIntent = await consumeFundedGreedDepositIntent({
-        id: Number(openIntent.id),
-        address,
-      });
-
-      if (!consumedIntent) {
-        return res.status(409).json({
-          error: "Funded intent could not be consumed",
-          code: "INTENT_CONSUME_FAILED",
-        });
-      }
-
-      await creditBalance({ address, amount: exactAmount });
-
-      const debited = await debitBalance({ address, amount: exactAmount });
-      if (!debited) {
-        return res.status(409).json({
-          error: "Failed to lock funded wager",
-          code: "FUNDED_WAGER_LOCK_FAILED",
-        });
-      }
-
-      lockedWager = round3(exactAmount);
-      fundedIntentId = Number(consumedIntent.id);
-      fundingSource = "intent";
-    }
-
-    const { totalTax, devCut, treasuryCut, jackpotCut, netStake } = getGreedTaxBreakdown(lockedWager);
-
-    const jackpotFeed = round3(lockedWager * GREED_JACKPOT_FEED_RATE);
-    await addToGreedJackpot(jackpotFeed);
-
-    const serverSeed = crypto.randomBytes(32).toString("hex");
-    const commitHash = sha256Hex(serverSeed);
-    const nonce = Date.now();
-    const poisonIndices = derivePoisonIndicesFromSeed(serverSeed, nonce, GREED_TOTAL_DONUTS, GREED_POISON_COUNT);
-
-    const round = await createGreedRound({
-      address,
-      wager: lockedWager,
-      netStake,
-      poisonIndices,
-      seed: serverSeed,
-      commitHash,
-      nonce,
-    });
-
-    await recordGreedTaxLedger({
-      address,
-      roundId: Number(round.id),
-      source: fundingSource === "balance" ? "greed_start_balance" : "greed_start_intent",
-      grossWager: lockedWager,
-      totalTax,
-      devCut,
-      treasuryCut,
-      jackpotCut,
-      note:
-        fundingSource === "balance"
-          ? "greed round started from internal balance"
-          : `greed round started from funded intent${fundedIntentId ? ` #${fundedIntentId}` : ""}`,
-    });
-
-    const displayName = await getDisplayNameForAddress(address);
-
-    if (GREED_SPECTATOR_ENABLED && spectatorChatId) {
-      registerLiveRound({
-        roundId: Number(round.id),
-        address,
-        displayName,
-        wager: requestedWager,
-        fundedExactAmount: lockedWager,
-        chatId: spectatorChatId,
-        startedAt: Date.now(),
-        updatedAt: Date.now(),
-        safeClicks: 0,
-        isActive: true,
-      });
-
-      await sendGymSpectatorMessageToChat(
-        spectatorChatId,
-        [
-          `🍩 FEED YOUR GREED LIVE`,
-          ``,
-          `${displayName} just locked a round.`,
-          `Requested wager: ${formatAmount3(requestedWager)} PHAT`,
-          `Locked amount: ${formatAmount3(lockedWager)} PHAT`,
-          `Round ID: #${Number(round.id)}`,
-          ``,
-          `Pick your donut in chat before they do 👇`,
-          `${formatDonutBoardLine()}`,
-        ].join("\n"),
-        {
-          reply_markup: Markup.inlineKeyboard([
-            [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-          ]).reply_markup,
-        }
-      );
-    }
-
-    return res.json({
-      ok: true,
-      roundId: round.id,
-      requestedWager,
-      fundedExactAmount: lockedWager,
-      wager: lockedWager,
-      netStake,
-      totalTax,
-      devCut,
-      treasuryCut,
-      jackpotCut,
-      jackpotFeed,
-      fundingSource,
-      totalDonuts: GREED_TOTAL_DONUTS,
-      poisonCount: GREED_POISON_COUNT,
-      currentMultiplier: 1.0,
-      cashoutAvailable: false,
-      fundedIntentId,
-      provablyFair: {
-        commitHash,
-        nonce,
-      },
-    });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Failed to start greed round" });
-  }
+    },
+  });
+} catch (e) {
+  console.error(e);
+  return res.status(500).json({ error: "Failed to start greed round" });
+}
 });
 
 app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
@@ -2568,7 +2429,11 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid roundId" });
     }
 
-    if (!Number.isFinite(pickedIndex) || pickedIndex < 0 || pickedIndex >= GREED_TOTAL_DONUTS) {
+    if (
+      !Number.isFinite(pickedIndex) ||
+      pickedIndex < 0 ||
+      pickedIndex >= GREED_TOTAL_DONUTS
+    ) {
       return res.status(400).json({ error: "Invalid pickedIndex" });
     }
 
