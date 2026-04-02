@@ -2130,6 +2130,46 @@ app.get("/greed/global-stats", async (_req: Request, res: Response) => {
   }
 });
 
+app.get("/greed/card", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const address = (req as any).user?.address as string;
+    const stats = await getGreedPlayerStatsLocal(address);
+
+    if (!stats) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    stats.greed_gods_rank = await getGreedGodRankForAddress(address);
+
+    return res.json({
+      ok: true,
+      card: {
+        address: stats.address,
+        displayName: stats.displayName,
+        total_wagered: stats.total_wagered,
+        net_profit: stats.net_profit,
+        total_won: stats.total_won,
+        total_lost: stats.total_lost,
+        total_rounds: stats.total_rounds,
+        busts: stats.busts,
+        cashouts: stats.cashouts,
+        perfect_runs: stats.perfect_runs,
+        biggest_cashout: stats.biggest_cashout,
+        biggest_jackpot: stats.biggest_jackpot,
+        high_multiplier_cashouts: stats.high_multiplier_cashouts,
+        best_run_depth: stats.best_run_depth,
+        cashout_rate: stats.cashout_rate,
+        greed_score: stats.greed_score,
+        tier: stats.tier,
+        greed_gods_rank: stats.greed_gods_rank,
+      },
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch greed card" });
+  }
+});
+
 app.get("/greed/player/:address", async (req: Request, res: Response) => {
   try {
     const address = String(req.params.address || "").trim();
@@ -2159,23 +2199,18 @@ app.get("/greed/gods", async (req: Request, res: Response) => {
   }
 });
 
-app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
+app.get("/greed/greed-gods", async (req: Request, res: Response) => {
   try {
-    const address = (req as any).user?.address as string;
-    const requestedWager = sanitizeWager(req.body?.wager);
-    const spectatorChatId = getSpectatorChatIdFromReq(req);
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit || 25)));
+    const rows = await getGreedGodsLeaderboardLocal(limit);
+    return res.json({ ok: true, rows });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch greed gods leaderboard" });
+  }
+});
 
-    if (requestedWager == null) {
-      return res.status(400).json({ error: `Wager must be between ${GREED_MIN_WAGER} and ${GREED_MAX_WAGER}` });
-    }
-
-    const existing = await getActiveGreedRound(address);
-    if (existing) {
-      return res.status(400).json({
-        error: "Round already active",
-        roundId: existing.id,
-      });
-    }
+app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
 
     await expireStaleGreedDepositIntents(address);
 
