@@ -212,6 +212,37 @@ type SpectatorRoundState = {
   isActive: boolean;
 };
 
+type GreedTier =
+  | "Light Snacker"
+  | "Heavy Feeder"
+  | "Glazed Up"
+  | "Sugar Hunter"
+  | "Stack Builder"
+  | "Certified PHAT"
+  | "Greed Operator"
+  | "Greed God";
+
+type GreedPlayerStats = {
+  address: string;
+  displayName: string;
+  total_wagered: number;
+  net_profit: number;
+  total_won: number;
+  total_lost: number;
+  total_rounds: number;
+  busts: number;
+  cashouts: number;
+  perfect_runs: number;
+  biggest_cashout: number;
+  biggest_jackpot: number;
+  high_multiplier_cashouts: number;
+  best_run_depth: number;
+  cashout_rate: number;
+  greed_score: number;
+  tier: GreedTier;
+  greed_gods_rank: number | null;
+};
+
 const liveSpectatorRounds = new Map<number, SpectatorRoundState>();
 let greedWatcherTimer: NodeJS.Timeout | null = null;
 let greedShoutTimer: NodeJS.Timeout | null = null;
@@ -281,6 +312,12 @@ function formatAmount3(n: number | string) {
   return value.toFixed(3);
 }
 
+function formatPct(n: number) {
+  const value = Number(n || 0);
+  if (!Number.isFinite(value)) return "0.0%";
+  return `${value.toFixed(1)}%`;
+}
+
 function parseAmount3(raw: unknown) {
   const value = Number(raw);
   if (!Number.isFinite(value)) return null;
@@ -292,6 +329,37 @@ function sanitizeWager(raw: unknown) {
   if (!Number.isFinite(wager)) return null;
   if (wager < GREED_MIN_WAGER || wager > GREED_MAX_WAGER) return null;
   return wager;
+}
+
+function getGreedTier(score: number): GreedTier {
+  const s = Number(score || 0);
+  if (s < 5_000) return "Light Snacker";
+  if (s < 20_000) return "Heavy Feeder";
+  if (s < 50_000) return "Glazed Up";
+  if (s < 120_000) return "Sugar Hunter";
+  if (s < 250_000) return "Stack Builder";
+  if (s < 500_000) return "Certified PHAT";
+  if (s < 1_000_000) return "Greed Operator";
+  return "Greed God";
+}
+
+function computeGreedScore(params: {
+  netProfit: number;
+  totalWagered: number;
+  perfectRuns: number;
+  highMultiplierCashouts: number;
+}) {
+  const netProfit = Number(params.netProfit || 0);
+  const totalWagered = Number(params.totalWagered || 0);
+  const perfectRuns = Number(params.perfectRuns || 0);
+  const highMultiplierCashouts = Number(params.highMultiplierCashouts || 0);
+
+  return round3(
+    netProfit * 1.0 +
+      totalWagered * 0.05 +
+      perfectRuns * 5000 +
+      highMultiplierCashouts * 2000
+  );
 }
 
 function serializeGreedIntent(row: any) {
@@ -481,6 +549,24 @@ async function sendGymSpectatorMessageToChat(chatId: string, text: string, extra
   }
 }
 
+async function sendMeaningfulGreedFeed(params: {
+  message: string;
+}) {
+  if (!GREED_SPECTATOR_ENABLED) return;
+  if (!GREED_SPECTATOR_CHAT_ID) return;
+  if (!process.env.TG_BOT_TOKEN) return;
+
+  try {
+    await sendGymSpectatorMessage(params.message, {
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+      ]).reply_markup,
+    });
+  } catch (e) {
+    console.error("Meaningful greed feed failed:", e);
+  }
+}
+
 function pickCardEmojis() {
   return ["🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩"];
 }
@@ -568,6 +654,249 @@ function startGreedShoutLoop() {
       console.error("Greed shout loop failed:", e);
     }
   }, GREED_SHOUT_INTERVAL_MS);
+}
+
+// -------------------------------
+// Greed stats / ranking helpers
+// -------------------------------
+async function getGreedGlobalStatsLocal() {
+  const [aggRes, jackpotRes, roundsSinceRes] = await Promise.all([
+    pool.query(
+      `
+      SELECT
+        COALESCE(SUM(wager), 0)::DOUBLE PRECISION AS total_wagered,
+        COUNT(*)::INT AS total_rounds,
+        COUNT(*) FILTER (WHERE result = 'poison')::INT AS total_busts,
+        COUNT(*) FILTER (WHERE result IN ('cashout', 'perfect'))::INT AS total_cashouts,
+        COUNT(*) FILTER (WHERE result = 'perfect')::INT AS perfect_runs,
+        COALESCE(MAX(payout), 0)::DOUBLE PRECISION AS biggest_cashout
+      FROM greed_rounds
+      WHERE status = 'closed';
+      `
+    ),
+    getGreedJackpotState(),
+    pool.query(
+      `
+      WITH last_jackpot AS (
+        SELECT COALESCE(MAX(id), 0) AS last_id
+        FROM greed_rounds
+        WHERE status = 'closed'
+          AND result = 'perfect'
+      )
+      SELECT COUNT(*)::INT AS rounds_since_jackpot
+      FROM greed_rounds, last_jackpot
+      WHERE greed_rounds.status = 'closed'
+        AND greed_rounds.id > last_jackpot.last_id;
+      `
+    ),
+  ]);
+
+  const agg = aggRes.rows[0] || {};
+  const totalRounds = Number(agg.total_rounds || 0);
+  const totalBusts = Number(agg.total_busts || 0);
+  const totalCashouts = Number(agg.total_cashouts || 0);
+
+  return {
+    total_wagered: Number(agg.total_wagered || 0),
+    total_rounds: totalRounds,
+    total_busts: totalBusts,
+    total_cashouts: totalCashouts,
+    perfect_runs: Number(agg.perfect_runs || 0),
+    current_jackpot: Number(jackpotRes?.current_amount || 0),
+    rounds_since_jackpot: Number(roundsSinceRes.rows?.[0]?.rounds_since_jackpot || 0),
+    biggest_cashout: Number(agg.biggest_cashout || 0),
+    bust_rate: totalRounds > 0 ? round3((totalBusts / totalRounds) * 100) : 0,
+    cashout_rate: totalRounds > 0 ? round3((totalCashouts / totalRounds) * 100) : 0,
+  };
+}
+
+async function getGreedPlayerStatsLocal(address: string): Promise<GreedPlayerStats | null> {
+  const a = String(address || "").trim();
+  if (!a) return null;
+
+  const [userRow, aggRes] = await Promise.all([
+    getMe(a),
+    pool.query(
+      `
+      SELECT
+        COALESCE(SUM(wager), 0)::DOUBLE PRECISION AS total_wagered,
+        COALESCE(SUM(CASE WHEN payout > wager THEN payout - wager ELSE 0 END), 0)::DOUBLE PRECISION AS net_profit,
+        COALESCE(SUM(CASE WHEN payout > 0 THEN payout ELSE 0 END), 0)::DOUBLE PRECISION AS total_won,
+        COALESCE(SUM(CASE WHEN payout < wager THEN wager - payout ELSE 0 END), 0)::DOUBLE PRECISION AS total_lost,
+        COUNT(*)::INT AS total_rounds,
+        COUNT(*) FILTER (WHERE result = 'poison')::INT AS busts,
+        COUNT(*) FILTER (WHERE result IN ('cashout', 'perfect'))::INT AS cashouts,
+        COUNT(*) FILTER (WHERE result = 'perfect')::INT AS perfect_runs,
+        COALESCE(MAX(payout), 0)::DOUBLE PRECISION AS biggest_cashout,
+        COALESCE(MAX(jackpot_won), 0)::DOUBLE PRECISION AS biggest_jackpot,
+        COUNT(*) FILTER (WHERE result = 'cashout' AND current_multiplier >= 2.5)::INT AS high_multiplier_cashouts,
+        COALESCE(MAX(safe_clicks), 0)::INT AS best_run_depth
+      FROM greed_rounds
+      WHERE address = $1
+        AND status = 'closed';
+      `,
+      [a]
+    ),
+  ]);
+
+  const row = aggRes.rows[0] || {};
+  const totalRounds = Number(row.total_rounds || 0);
+  const cashouts = Number(row.cashouts || 0);
+  const netProfit = Number(row.net_profit || 0);
+  const totalWagered = Number(row.total_wagered || 0);
+  const perfectRuns = Number(row.perfect_runs || 0);
+  const highMultiplierCashouts = Number(row.high_multiplier_cashouts || 0);
+  const greedScore = computeGreedScore({
+    netProfit,
+    totalWagered,
+    perfectRuns,
+    highMultiplierCashouts,
+  });
+
+  return {
+    address: a,
+    displayName: displayNameFromUserRow(userRow, a),
+    total_wagered: totalWagered,
+    net_profit: netProfit,
+    total_won: Number(row.total_won || 0),
+    total_lost: Number(row.total_lost || 0),
+    total_rounds: totalRounds,
+    busts: Number(row.busts || 0),
+    cashouts,
+    perfect_runs: perfectRuns,
+    biggest_cashout: Number(row.biggest_cashout || 0),
+    biggest_jackpot: Number(row.biggest_jackpot || 0),
+    high_multiplier_cashouts: highMultiplierCashouts,
+    best_run_depth: Number(row.best_run_depth || 0),
+    cashout_rate: totalRounds > 0 ? round3((cashouts / totalRounds) * 100) : 0,
+    greed_score: greedScore,
+    tier: getGreedTier(greedScore),
+    greed_gods_rank: null,
+  };
+}
+
+async function getGreedGodsLeaderboardLocal(limit = 25) {
+  const lim = Math.max(1, Math.min(200, Number(limit || 25)));
+
+  const r = await pool.query(
+    `
+    WITH stats AS (
+      SELECT
+        gr.address,
+        COALESCE(SUM(gr.wager), 0)::DOUBLE PRECISION AS total_wagered,
+        COALESCE(SUM(CASE WHEN gr.payout > gr.wager THEN gr.payout - gr.wager ELSE 0 END), 0)::DOUBLE PRECISION AS net_profit,
+        COUNT(*) FILTER (WHERE gr.result = 'perfect')::INT AS perfect_runs,
+        COUNT(*) FILTER (WHERE gr.result = 'cashout' AND gr.current_multiplier >= 2.5)::INT AS high_multiplier_cashouts
+      FROM greed_rounds gr
+      WHERE gr.status = 'closed'
+      GROUP BY gr.address
+    )
+    SELECT
+      s.address,
+      u.display_name,
+      s.total_wagered,
+      s.net_profit,
+      s.perfect_runs,
+      s.high_multiplier_cashouts,
+      (
+        (s.net_profit * 1.0) +
+        (s.total_wagered * 0.05) +
+        (s.perfect_runs * 5000) +
+        (s.high_multiplier_cashouts * 2000)
+      )::DOUBLE PRECISION AS greed_score
+    FROM stats s
+    LEFT JOIN users u ON u.address = s.address
+    ORDER BY greed_score DESC, s.total_wagered DESC
+    LIMIT $1;
+    `,
+    [lim]
+  );
+
+  return (r.rows || []).map((row: any, idx: number) => ({
+    rank: idx + 1,
+    address: row.address,
+    displayName: row.display_name || null,
+    totalWagered: Number(row.total_wagered || 0),
+    netProfit: Number(row.net_profit || 0),
+    perfectRuns: Number(row.perfect_runs || 0),
+    highMultiplierCashouts: Number(row.high_multiplier_cashouts || 0),
+    greedScore: Number(row.greed_score || 0),
+    tier: getGreedTier(Number(row.greed_score || 0)),
+  }));
+}
+
+async function getGreedGodRankForAddress(address: string) {
+  const a = String(address || "").trim();
+  if (!a) return null;
+
+  const r = await pool.query(
+    `
+    WITH stats AS (
+      SELECT
+        gr.address,
+        (
+          (COALESCE(SUM(CASE WHEN gr.payout > gr.wager THEN gr.payout - gr.wager ELSE 0 END), 0)::DOUBLE PRECISION * 1.0) +
+          (COALESCE(SUM(gr.wager), 0)::DOUBLE PRECISION * 0.05) +
+          (COUNT(*) FILTER (WHERE gr.result = 'perfect')::INT * 5000) +
+          (COUNT(*) FILTER (WHERE gr.result = 'cashout' AND gr.current_multiplier >= 2.5)::INT * 2000)
+        )::DOUBLE PRECISION AS greed_score
+      FROM greed_rounds gr
+      WHERE gr.status = 'closed'
+      GROUP BY gr.address
+    ),
+    ranked AS (
+      SELECT
+        address,
+        greed_score,
+        ROW_NUMBER() OVER (ORDER BY greed_score DESC, address ASC) AS rank_num
+      FROM stats
+    )
+    SELECT rank_num
+    FROM ranked
+    WHERE address = $1
+    LIMIT 1;
+    `,
+    [a]
+  );
+
+  return r.rows[0] ? Number(r.rows[0].rank_num || 0) : null;
+}
+
+async function findUserByGreedCardQuery(query: string) {
+  const q = String(query || "").trim();
+  if (!q) return null;
+
+  if (q.startsWith("tg:")) {
+    return getMe(q);
+  }
+
+  if (q.startsWith("@")) {
+    const username = q.replace(/^@/, "").trim().toLowerCase();
+
+    const r = await pool.query(
+      `
+      SELECT *
+      FROM users
+      WHERE LOWER(tg_username) = $1
+      LIMIT 1;
+      `,
+      [username]
+    );
+
+    return r.rows[0] || null;
+  }
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM users
+    WHERE LOWER(display_name) = $1
+    LIMIT 1;
+    `,
+    [q.toLowerCase()]
+  );
+
+  return r.rows[0] || null;
 }
 
 // -------------------------------
@@ -1244,7 +1573,6 @@ function getGreedTaxBreakdown(lockedWager: number) {
   const netStake = round3(lockedWager - totalTax);
   return { totalTax, devCut, treasuryCut, jackpotCut, netStake };
 }
-
 // -------------------------------
 // Routes
 // -------------------------------
@@ -1283,6 +1611,9 @@ app.get("/", (_req: Request, res: Response) => {
         "  GET  /greed/active",
         "  GET  /greed/leaderboards",
         "  GET  /greed/feed",
+        "  GET  /greed/global-stats",
+        "  GET  /greed/player/:address",
+        "  GET  /greed/gods",
         "",
         "tapping counts as cardio 🟣🟡",
       ].join("\n")
@@ -1789,6 +2120,45 @@ app.get("/greed/jackpot", async (_req: Request, res: Response) => {
   }
 });
 
+app.get("/greed/global-stats", async (_req: Request, res: Response) => {
+  try {
+    const stats = await getGreedGlobalStatsLocal();
+    return res.json({ ok: true, stats });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch global stats" });
+  }
+});
+
+app.get("/greed/player/:address", async (req: Request, res: Response) => {
+  try {
+    const address = String(req.params.address || "").trim();
+    const stats = await getGreedPlayerStatsLocal(address);
+
+    if (!stats) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    stats.greed_gods_rank = await getGreedGodRankForAddress(address);
+
+    return res.json({ ok: true, stats });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch player stats" });
+  }
+});
+
+app.get("/greed/gods", async (req: Request, res: Response) => {
+  try {
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit || 25)));
+    const rows = await getGreedGodsLeaderboardLocal(limit);
+    return res.json({ ok: true, rows });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch greed gods leaderboard" });
+  }
+});
+
 app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
@@ -2143,6 +2513,14 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         closeLiveRound(roundId);
       }
 
+      await sendMeaningfulGreedFeed({
+        message: [
+          `👑 ${displayNameFromUserRow(await getMe(address), address)} just cleared a 10/10 box`,
+          `Full payout secured: ${formatAmount3(totalPayout)} PHAT`,
+          `Jackpot hit: ${formatAmount3(jackpotWon)} PHAT`,
+        ].join("\n"),
+      });
+
       return res.json({
         ok: true,
         result: "perfect",
@@ -2317,6 +2695,15 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
       closeLiveRound(roundId);
     }
 
+    if (currentMultiplier >= 2.5) {
+      await sendMeaningfulGreedFeed({
+        message: [
+          `💸 ${displayNameFromUserRow(await getMe(address), address)} cashed out at ${currentMultiplier.toFixed(2)}x`,
+          `Stacking ${formatAmount3(payout)} PHAT`,
+        ].join("\n"),
+      });
+    }
+
     return res.json({
       ok: true,
       result: "cashout",
@@ -2386,12 +2773,13 @@ app.get("/greed/leaderboards", async (req: Request, res: Response) => {
     const window = normalizeWindow(req.query.window || "lifetime");
     const limit = Math.max(1, Math.min(100, Number(req.query.limit || 10)));
 
-    const [mostWagered, mostWon, perfectRuns, biggestCashout, topGlazeSacrifices] = await Promise.all([
+    const [mostWagered, mostWon, perfectRuns, biggestCashout, topGlazeSacrifices, greedGods] = await Promise.all([
       getGreedLeaderboard({ board: "most_wagered", window, limit }),
       getGreedLeaderboard({ board: "most_won", window, limit }),
       getGreedLeaderboard({ board: "perfect_runs", window, limit }),
       getGreedLeaderboard({ board: "biggest_cashout", window, limit }),
       getGreedLeaderboard({ board: "top_glaze_sacrifices", window, limit }),
+      getGreedGodsLeaderboardLocal(limit),
     ]);
 
     return res.json({
@@ -2403,6 +2791,7 @@ app.get("/greed/leaderboards", async (req: Request, res: Response) => {
         perfectRuns,
         biggestCashout,
         topGlazeSacrifices,
+        greedGods,
       },
     });
   } catch (e) {
@@ -2850,6 +3239,72 @@ gymBot.command("greedlive", async (ctx) => {
     );
   } catch (e) {
     console.error("GYM /greedlive button error:", e);
+  }
+});
+
+gymBot.command("greedcard", async (ctx) => {
+  try {
+    const rawText = String(ctx.message?.text || "").trim();
+    const parts = rawText.split(/\s+/);
+    const query = parts.slice(1).join(" ").trim();
+
+    let userRow: any = null;
+
+    if (query) {
+      userRow = await findUserByGreedCardQuery(query);
+    } else {
+      userRow = await getMe(`tg:${ctx.from.id}`);
+    }
+
+    if (!userRow) {
+      await ctx.reply("User not found.");
+      return;
+    }
+
+    const stats = await getGreedPlayerStatsLocal(String(userRow.address || ""));
+    if (!stats) {
+      await ctx.reply("No Greed stats yet.");
+      return;
+    }
+
+    stats.greed_gods_rank = await getGreedGodRankForAddress(stats.address);
+
+    const msg = [
+      `🏆 GREED CARD`,
+      `${stats.displayName}`,
+      `Greed Gods Rank #${stats.greed_gods_rank || "-"}`,
+      `Tier ${stats.tier}`,
+      ``,
+      `Action`,
+      `Big Appetites ${formatAmount3(stats.total_wagered)} PHAT`,
+      `Total Rounds ${stats.total_rounds}`,
+      ``,
+      `Performance`,
+      `Phat Stacks ${formatAmount3(stats.net_profit)} PHAT`,
+      `Cashout Rate ${formatPct(stats.cashout_rate)}`,
+      `10/10 Boxes ${stats.perfect_runs}`,
+      ``,
+      `Damage`,
+      `Glaze Donors ${formatAmount3(stats.total_lost)} PHAT`,
+      `Busts ${stats.busts}`,
+      ``,
+      `Highlights`,
+      `Biggest Cashout ${formatAmount3(stats.biggest_cashout)} PHAT`,
+      `Best Run Depth ${stats.best_run_depth}`,
+      ``,
+      `Prestige`,
+      `Greed Score ${formatAmount3(stats.greed_score)}`,
+    ].join("\n");
+
+    await ctx.reply(
+      msg,
+      Markup.inlineKeyboard([[Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]])
+    );
+  } catch (e) {
+    console.error("GYM /greedcard error:", e);
+    try {
+      await ctx.reply("Failed to load Greed Card.");
+    } catch {}
   }
 });
 
