@@ -2451,7 +2451,7 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
         });
       }
 
-      lockedWager = round3(exactAmount);
+      lockedWager = round3(requestedWager);
       fundedIntentId = Number(consumedIntent.id);
       fundingSource = "intent";
       fundingModeUsed = "single_round_intent";
