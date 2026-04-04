@@ -243,13 +243,16 @@ export async function initDb() {
     CREATE TABLE IF NOT EXISTS greed_deposit_intents (
       id BIGSERIAL PRIMARY KEY,
       address TEXT NOT NULL REFERENCES users(address) ON DELETE CASCADE,
+      intent_type TEXT NOT NULL DEFAULT 'single_round',
       requested_wager NUMERIC(18,3) NOT NULL,
       exact_amount NUMERIC(18,3) NOT NULL,
+      funded_amount NUMERIC(18,3),
       deposit_wallet TEXT NOT NULL,
       sender_wallet TEXT,
       token_mint TEXT,
       tx_signature TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
+      funding_match_status TEXT NOT NULL DEFAULT 'unmatched',
       expires_at TIMESTAMPTZ NOT NULL,
       funded_at TIMESTAMPTZ,
       started_at TIMESTAMPTZ,
@@ -260,13 +263,16 @@ export async function initDb() {
 
   await pool.query(`
     ALTER TABLE greed_deposit_intents
+    ADD COLUMN IF NOT EXISTS intent_type TEXT NOT NULL DEFAULT 'single_round',
     ADD COLUMN IF NOT EXISTS requested_wager NUMERIC(18,3) NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS exact_amount NUMERIC(18,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS funded_amount NUMERIC(18,3),
     ADD COLUMN IF NOT EXISTS deposit_wallet TEXT NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS sender_wallet TEXT,
     ADD COLUMN IF NOT EXISTS token_mint TEXT,
     ADD COLUMN IF NOT EXISTS tx_signature TEXT,
     ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending',
+    ADD COLUMN IF NOT EXISTS funding_match_status TEXT NOT NULL DEFAULT 'unmatched',
     ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '10 minutes'),
     ADD COLUMN IF NOT EXISTS funded_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
@@ -277,12 +283,14 @@ export async function initDb() {
   await pool.query(`
     ALTER TABLE greed_deposit_intents
     ALTER COLUMN requested_wager TYPE NUMERIC(18,3) USING (requested_wager::numeric),
-    ALTER COLUMN exact_amount TYPE NUMERIC(18,3) USING (exact_amount::numeric);
+    ALTER COLUMN exact_amount TYPE NUMERIC(18,3) USING (exact_amount::numeric),
+    ALTER COLUMN funded_amount TYPE NUMERIC(18,3) USING (funded_amount::numeric);
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_intents_address_created ON greed_deposit_intents(address, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_intents_status_created ON greed_deposit_intents(status, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_intents_expires ON greed_deposit_intents(expires_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_intents_type_status_created ON greed_deposit_intents(intent_type, status, created_at DESC);`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_greed_intents_tx_signature_unique ON greed_deposit_intents(tx_signature) WHERE tx_signature IS NOT NULL;`);
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_greed_intents_one_open_per_user
@@ -950,7 +958,6 @@ export async function recordDeposit(params: {
 
   return r.rows[0] || null;
 }
-
 // -------------------------------
 // Greed deposit intent helpers
 // -------------------------------
@@ -974,11 +981,16 @@ export async function expireStaleGreedDepositIntents(address?: string) {
   return r.rows || [];
 }
 
-export async function getOpenGreedDepositIntentByAddress(address: string) {
+export async function getOpenGreedDepositIntentByAddress(
+  address: string,
+  intentType?: "single_round" | "balance_fund"
+) {
   const a = String(address || "").trim();
   if (!a) throw new Error("missing address");
 
   await expireStaleGreedDepositIntents(a);
+
+  const type = intentType ? String(intentType).trim() : null;
 
   const r = await pool.query(
     `
@@ -986,10 +998,11 @@ export async function getOpenGreedDepositIntentByAddress(address: string) {
     FROM greed_deposit_intents
     WHERE address = $1
       AND status IN ('pending', 'funded')
+      AND ($2::text IS NULL OR intent_type = $2)
     ORDER BY created_at DESC
     LIMIT 1;
     `,
-    [a]
+    [a, type]
   );
 
   return r.rows[0] || null;
@@ -1020,6 +1033,7 @@ export async function getGreedDepositIntentByIdForAddress(id: number, address: s
 
 export async function createGreedDepositIntent(params: {
   address: string;
+  intentType?: "single_round" | "balance_fund";
   requestedWager: number | string;
   exactAmount: number | string;
   depositWallet: string;
@@ -1027,6 +1041,10 @@ export async function createGreedDepositIntent(params: {
   expiresInMinutes?: number;
 }) {
   const address = String(params.address || "").trim();
+  const intentType =
+    String(params.intentType || "single_round").trim() === "balance_fund"
+      ? "balance_fund"
+      : "single_round";
   const requestedWager = asAmount(params.requestedWager);
   const exactAmount = asAmount(params.exactAmount);
   const depositWallet = String(params.depositWallet || "").trim();
@@ -1048,29 +1066,35 @@ export async function createGreedDepositIntent(params: {
     `
     INSERT INTO greed_deposit_intents (
       address,
+      intent_type,
       requested_wager,
       exact_amount,
+      funded_amount,
       deposit_wallet,
       token_mint,
       status,
+      funding_match_status,
       expires_at,
       created_at,
       updated_at
     )
     VALUES (
       $1,
-      $2::numeric,
+      $2,
       $3::numeric,
-      $4,
+      $4::numeric,
+      NULL,
       $5,
+      $6,
       'pending',
-      NOW() + ($6::TEXT || ' minutes')::INTERVAL,
+      'unmatched',
+      NOW() + ($7::TEXT || ' minutes')::INTERVAL,
       NOW(),
       NOW()
     )
     RETURNING *;
     `,
-    [address, requestedWager, exactAmount, depositWallet, tokenMint, expiresInMinutes]
+    [address, intentType, requestedWager, exactAmount, depositWallet, tokenMint, expiresInMinutes]
   );
 
   return r.rows[0] || null;
@@ -1111,12 +1135,16 @@ export async function markGreedDepositIntentFunded(params: {
   txSignature: string;
   senderWallet?: string | null;
   tokenMint?: string | null;
+  fundedAmount?: number | string | null;
+  fundingMatchStatus?: "exact" | "underpaid" | "overpaid" | "unmatched";
 }) {
   const id = Math.max(0, Math.floor(Number(params.id || 0)));
   const address = String(params.address || "").trim();
   const txSignature = String(params.txSignature || "").trim();
   const senderWallet = params.senderWallet ? String(params.senderWallet).trim() : null;
   const tokenMint = params.tokenMint ? String(params.tokenMint).trim() : null;
+  const fundedAmount = params.fundedAmount == null ? null : asAmount(params.fundedAmount);
+  const fundingMatchStatus = String(params.fundingMatchStatus || "exact").trim();
 
   if (!id) throw new Error("missing id");
   if (!address) throw new Error("missing address");
@@ -1130,6 +1158,8 @@ export async function markGreedDepositIntentFunded(params: {
       tx_signature = $3,
       sender_wallet = COALESCE($4, sender_wallet),
       token_mint = COALESCE($5, token_mint),
+      funded_amount = COALESCE($6::numeric, funded_amount),
+      funding_match_status = $7,
       funded_at = NOW(),
       updated_at = NOW()
     WHERE id = $1
@@ -1138,7 +1168,7 @@ export async function markGreedDepositIntentFunded(params: {
       AND expires_at > NOW()
     RETURNING *;
     `,
-    [id, address, txSignature, senderWallet, tokenMint]
+    [id, address, txSignature, senderWallet, tokenMint, fundedAmount, fundingMatchStatus]
   );
 
   return r.rows[0] || null;
@@ -1147,9 +1177,11 @@ export async function markGreedDepositIntentFunded(params: {
 export async function findGreedDepositIntentByExactAmount(params: {
   exactAmount: number | string;
   status?: "pending" | "funded";
+  intentType?: "single_round" | "balance_fund" | string;
 }) {
   const exactAmount = asAmount(params.exactAmount);
   const status = String(params.status || "pending").trim();
+  const intentType = params.intentType ? String(params.intentType).trim() : null;
 
   if (Number(exactAmount) <= 0) throw new Error("invalid exactAmount");
 
@@ -1160,10 +1192,11 @@ export async function findGreedDepositIntentByExactAmount(params: {
     WHERE exact_amount = $1::numeric
       AND status = $2
       AND expires_at > NOW()
+      AND ($3::text IS NULL OR intent_type = $3)
     ORDER BY created_at ASC
     LIMIT 1;
     `,
-    [exactAmount, status]
+    [exactAmount, status, intentType]
   );
 
   return r.rows[0] || null;
@@ -1183,7 +1216,10 @@ export async function consumeFundedGreedDepositIntent(params: {
     `
     UPDATE greed_deposit_intents
     SET
-      status = 'consumed',
+      status = CASE
+        WHEN intent_type = 'single_round' THEN 'consumed'
+        ELSE status
+      END,
       started_at = COALESCE(started_at, NOW()),
       updated_at = NOW()
     WHERE id = $1
