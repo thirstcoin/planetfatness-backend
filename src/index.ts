@@ -3348,7 +3348,7 @@ gymBot.command("greedcard", async (ctx) => {
       `Total Rounds ${stats.total_rounds}`,
       ``,
       `Performance`,
-      `Phat Stacks ${formatAmount3(stats.net_profit)} PHAT`,
+      `Phat Stacks ${formatAmount3(stats.total_won)} PHAT`,
       `Cashout Rate ${formatPct(stats.cashout_rate)}`,
       `10/10 Boxes ${stats.perfect_runs}`,
       ``,
