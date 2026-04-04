@@ -1216,10 +1216,7 @@ export async function consumeFundedGreedDepositIntent(params: {
     `
     UPDATE greed_deposit_intents
     SET
-      status = CASE
-        WHEN intent_type = 'single_round' THEN 'consumed'
-        ELSE status
-      END,
+      status = 'consumed',
       started_at = COALESCE(started_at, NOW()),
       updated_at = NOW()
     WHERE id = $1
