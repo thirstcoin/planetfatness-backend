@@ -1927,17 +1927,19 @@ export async function getGreedLeaderboard(params: {
       ORDER BY value DESC
       LIMIT $1;
     `;
-  } else if (params.board === "most_won") {
+   } else if (params.board === "most_won") {
     sql = `
       SELECT
         gr.address,
         u.display_name,
-        (COALESCE(SUM(gr.payout),0) - COALESCE(SUM(gr.wager),0))::DOUBLE PRECISION AS value
+        COALESCE(SUM(gr.payout),0)::DOUBLE PRECISION AS value
       FROM greed_rounds gr
       LEFT JOIN users u ON u.address = gr.address
       WHERE gr.status = 'closed'
+        AND gr.result IN ('cashout', 'perfect')
         ${whereTime}
       GROUP BY gr.address, u.display_name
+      HAVING COALESCE(SUM(gr.payout),0) > 0
       ORDER BY value DESC
       LIMIT $1;
     `;
