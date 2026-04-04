@@ -90,6 +90,7 @@ const {
   getGreedUnmatchedDepositBySignature,
   getOpenGreedUnmatchedDeposits,
   markGreedUnmatchedDepositResolved,
+  getGreedAdminTreasurySnapshot,
 } = dbMod;
 
 // -------------------------------
@@ -1687,11 +1688,28 @@ app.get("/wallet/deposit-info", requireAuth, async (_req: Request, res: Response
     treasuryWallet: String(process.env.TREASURY_WALLET || "").trim() || null,
     acceptedToken: PHAT_TOKEN_MINT,
     mode: "intent-funding",
+    intentPrecision: 3,
+    fundingModes: {
+      singleRoundWager: {
+        key: "single_round",
+        label: "Single Round Wager",
+        description: "Create a unique 3-decimal funding intent for one locked round wager.",
+      },
+      internalBalanceFund: {
+        key: "balance_fund",
+        label: "Internal Balance Fund",
+        description: "Create a unique 3-decimal funding intent to credit your internal balance for multiple future rounds.",
+      },
+    },
+    quickWagers: [1000, 5000, 10000, 25000, 50000],
     bankrollSignerLoaded: !!bankrollKeypair,
     watcher: {
       enabled: SOLANA_WATCH_ENABLED,
       intervalMs: SOLANA_WATCH_INTERVAL_MS,
       watcherTarget: PHAT_TOKEN_ACCOUNT || DEPOSIT_WALLET || null,
+      uniqueExactAmountRequired: true,
+      decimalsRequired: 3,
+      supportsIntentTypes: ["single_round", "balance_fund"],
     },
     withdrawals: {
       enabled: WITHDRAWALS_ENABLED,
@@ -2005,6 +2023,18 @@ app.get("/greed/deposit-intent", requireAuth, async (req: Request, res: Response
         acceptedToken: PHAT_TOKEN_MINT,
         depositWallet: DEPOSIT_WALLET || null,
         expiresInMinutes: GREED_INTENT_EXPIRES_MINUTES,
+        intentPrecision: 3,
+        uniqueExactAmountRequired: true,
+        fundingModes: {
+          single_round: {
+            label: "Single Round Wager",
+            description: "Fund one exact wager amount for one locked round.",
+          },
+          balance_fund: {
+            label: "Internal Balance Fund",
+            description: "Fund your internal balance with a unique exact amount for multiple future rounds.",
+          },
+        },
       },
     });
   } catch (e) {
@@ -2030,6 +2060,8 @@ app.get("/greed/deposit-intent/:id", requireAuth, async (req: Request, res: Resp
     return res.json({
       ok: true,
       intent: serializeGreedIntent(intent),
+      fundingMode: "single_round",
+      note: "Current DB schema does not yet persist funding mode, so open intents are treated as single_round until the next DB patch.",
     });
   } catch (e) {
     console.error(e);
@@ -2040,10 +2072,18 @@ app.get("/greed/deposit-intent/:id", requireAuth, async (req: Request, res: Resp
 app.post("/greed/deposit-intent", requireAuth, async (req: Request, res: Response) => {
   try {
     const address = (req as any).user?.address as string;
-    const wager = sanitizeWager(req.body?.wager);
+    const fundingMode = String(req.body?.fundingMode || "single_round").trim().toLowerCase();
+    const requestedAmountRaw = req.body?.amount ?? req.body?.wager;
+    const requestedAmount = sanitizeWager(requestedAmountRaw);
 
-    if (wager == null) {
-      return res.status(400).json({ error: `Wager must be between ${GREED_MIN_WAGER} and ${GREED_MAX_WAGER}` });
+    if (fundingMode !== "single_round" && fundingMode !== "balance_fund") {
+      return res.status(400).json({ error: "Invalid fundingMode" });
+    }
+
+    if (requestedAmount == null) {
+      return res.status(400).json({
+        error: `Amount must be between ${GREED_MIN_WAGER} and ${GREED_MAX_WAGER}`,
+      });
     }
 
     if (!DEPOSIT_WALLET) {
@@ -2057,15 +2097,17 @@ app.post("/greed/deposit-intent", requireAuth, async (req: Request, res: Respons
       return res.json({
         ok: true,
         reused: true,
+        fundingMode,
         intent: serializeGreedIntent(existing),
+        note: "Current DB schema supports one open unique 3-decimal intent per user.",
       });
     }
 
-    const exactAmount = await generateUniqueExactAmount(wager);
+    const exactAmount = await generateUniqueExactAmount(requestedAmount);
 
     const intent = await createGreedDepositIntent({
       address,
-      requestedWager: wager,
+      requestedWager: requestedAmount,
       exactAmount,
       depositWallet: DEPOSIT_WALLET,
       tokenMint: PHAT_TOKEN_MINT,
@@ -2075,7 +2117,18 @@ app.post("/greed/deposit-intent", requireAuth, async (req: Request, res: Respons
     return res.json({
       ok: true,
       reused: false,
+      fundingMode,
       intent: serializeGreedIntent(intent),
+      fundingPreview: {
+        requestedAmount,
+        exactAmount,
+        intentPrecision: 3,
+        useCase:
+          fundingMode === "balance_fund"
+            ? "Credit internal balance after watcher/admin funding match."
+            : "Use for one single locked round wager.",
+      },
+      note: "Funding mode is accepted by the API now, but your current DB schema does not persist intent type yet.",
     });
   } catch (e) {
     console.error(e);
@@ -2235,12 +2288,14 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
     let lockedWager = 0;
     let fundedIntentId: number | null = null;
     let fundingSource: "balance" | "intent" = "balance";
+    let fundingModeUsed: "internal_balance" | "single_round_intent" = "internal_balance";
 
     const bal = await getBalance(address);
     const available = round3(Number(bal?.available_balance || 0));
 
     if (available >= requestedWager) {
       const debited = await debitBalance({ address, amount: requestedWager });
+
       if (!debited) {
         return res.status(409).json({
           error: "Failed to lock balance wager",
@@ -2250,12 +2305,15 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
 
       lockedWager = round3(requestedWager);
       fundingSource = "balance";
+      fundingModeUsed = "internal_balance";
     } else {
       const openIntent = await getOpenGreedDepositIntentByAddress(address);
+
       if (!openIntent) {
         return res.status(400).json({
           error: "Funding required",
           code: "FUNDING_REQUIRED",
+          message: "Not enough internal balance and no funded single-round intent found.",
         });
       }
 
@@ -2267,154 +2325,164 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
         });
       }
 
-    const intentWager = Number(openIntent.requested_wager || 0);
-    const exactAmount = round3(Number(openIntent.exact_amount || 0));
+      const intentWager = Number(openIntent.requested_wager || 0);
+      const exactAmount = round3(Number(openIntent.exact_amount || 0));
 
-    if (intentWager !== requestedWager) {
-      return res.status(400).json({
-        error: "Wager does not match funded intent",
-        code: "INTENT_WAGER_MISMATCH",
-        intent: serializeGreedIntent(openIntent),
-      });
-    }
-
-    const consumedIntent = await consumeFundedGreedDepositIntent({
-      id: Number(openIntent.id),
-      address,
-    });
-
-    if (!consumedIntent) {
-      return res.status(409).json({
-        error: "Funded intent could not be consumed",
-        code: "INTENT_CONSUME_FAILED",
-      });
-    }
-
-    await creditBalance({ address, amount: exactAmount });
-
-    const debited = await debitBalance({ address, amount: exactAmount });
-    if (!debited) {
-      return res.status(409).json({
-        error: "Failed to lock funded wager",
-        code: "FUNDED_WAGER_LOCK_FAILED",
-      });
-    }
-
-    lockedWager = round3(exactAmount);
-    fundedIntentId = Number(consumedIntent.id);
-    fundingSource = "intent";
-  }
-
-  const { totalTax, devCut, treasuryCut, jackpotCut, netStake } =
-    getGreedTaxBreakdown(lockedWager);
-
-  const jackpotFeed = round3(lockedWager * GREED_JACKPOT_FEED_RATE);
-  await addToGreedJackpot(jackpotFeed);
-
-  const serverSeed = crypto.randomBytes(32).toString("hex");
-  const commitHash = sha256Hex(serverSeed);
-  const nonce = Date.now();
-  const poisonIndices = derivePoisonIndicesFromSeed(
-    serverSeed,
-    nonce,
-    GREED_TOTAL_DONUTS,
-    GREED_POISON_COUNT
-  );
-
-  const round = await createGreedRound({
-    address,
-    wager: lockedWager,
-    netStake,
-    poisonIndices,
-    seed: serverSeed,
-    commitHash,
-    nonce,
-  });
-
-  await recordGreedTaxLedger({
-    address,
-    roundId: Number(round.id),
-    source:
-      fundingSource === "balance"
-        ? "greed_start_balance"
-        : "greed_start_intent",
-    grossWager: lockedWager,
-    totalTax,
-    devCut,
-    treasuryCut,
-    jackpotCut,
-    note:
-      fundingSource === "balance"
-        ? "greed round started from internal balance"
-        : `greed round started from funded intent${
-            fundedIntentId ? ` #${fundedIntentId}` : ""
-          }`,
-  });
-
-  const displayName = await getDisplayNameForAddress(address);
-
-  if (GREED_SPECTATOR_ENABLED && spectatorChatId) {
-    registerLiveRound({
-      roundId: Number(round.id),
-      address,
-      displayName,
-      wager: requestedWager,
-      fundedExactAmount: lockedWager,
-      chatId: spectatorChatId,
-      startedAt: Date.now(),
-      updatedAt: Date.now(),
-      safeClicks: 0,
-      isActive: true,
-    });
-
-    await sendGymSpectatorMessageToChat(
-      spectatorChatId,
-      [
-        `🍩 FEED YOUR GREED LIVE`,
-        ``,
-        `${displayName} just locked a round.`,
-        `Requested wager: ${formatAmount3(requestedWager)} PHAT`,
-        `Locked amount: ${formatAmount3(lockedWager)} PHAT`,
-        `Round ID: #${Number(round.id)}`,
-        ``,
-        `Pick your donut in chat before they do 👇`,
-        `${formatDonutBoardLine()}`,
-      ].join("\n"),
-      {
-        reply_markup: Markup.inlineKeyboard([
-          [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-        ]).reply_markup,
+      if (intentWager !== requestedWager) {
+        return res.status(400).json({
+          error: "Wager does not match funded intent",
+          code: "INTENT_WAGER_MISMATCH",
+          intent: serializeGreedIntent(openIntent),
+        });
       }
-    );
-  }
 
-  return res.json({
-    ok: true,
-    roundId: round.id,
-    requestedWager,
-    fundedExactAmount: lockedWager,
-    wager: lockedWager,
-    netStake,
-    totalTax,
-    devCut,
-    treasuryCut,
-    jackpotCut,
-    jackpotFeed,
-    fundingSource,
-    totalDonuts: GREED_TOTAL_DONUTS,
-    poisonCount: GREED_POISON_COUNT,
-    currentMultiplier: 1.0,
-    cashoutAvailable: false,
-    fundedIntentId,
-    provablyFair: {
+      const consumedIntent = await consumeFundedGreedDepositIntent({
+        id: Number(openIntent.id),
+        address,
+      });
+
+      if (!consumedIntent) {
+        return res.status(409).json({
+          error: "Funded intent could not be consumed",
+          code: "INTENT_CONSUME_FAILED",
+        });
+      }
+
+      await creditBalance({ address, amount: exactAmount });
+
+      const debited = await debitBalance({ address, amount: exactAmount });
+      if (!debited) {
+        return res.status(409).json({
+          error: "Failed to lock funded wager",
+          code: "FUNDED_WAGER_LOCK_FAILED",
+        });
+      }
+
+      lockedWager = round3(exactAmount);
+      fundedIntentId = Number(consumedIntent.id);
+      fundingSource = "intent";
+      fundingModeUsed = "single_round_intent";
+    }
+
+    const { totalTax, devCut, treasuryCut, jackpotCut, netStake } =
+      getGreedTaxBreakdown(lockedWager);
+
+    const jackpotFeed = round3(lockedWager * GREED_JACKPOT_FEED_RATE);
+    await addToGreedJackpot(jackpotFeed);
+
+    const serverSeed = crypto.randomBytes(32).toString("hex");
+    const commitHash = sha256Hex(serverSeed);
+    const nonce = Date.now();
+    const poisonIndices = derivePoisonIndicesFromSeed(
+      serverSeed,
+      nonce,
+      GREED_TOTAL_DONUTS,
+      GREED_POISON_COUNT
+    );
+
+    const round = await createGreedRound({
+      address,
+      wager: lockedWager,
+      netStake,
+      poisonIndices,
+      seed: serverSeed,
       commitHash,
       nonce,
-    },
-  });
-} catch (e) {
-  console.error(e);
-  return res.status(500).json({ error: "Failed to start greed round" });
-}
+    });
+
+    await recordGreedTaxLedger({
+      address,
+      roundId: Number(round.id),
+      source:
+        fundingSource === "balance"
+          ? "greed_start_balance"
+          : "greed_start_intent",
+      grossWager: lockedWager,
+      totalTax,
+      devCut,
+      treasuryCut,
+      jackpotCut,
+      note:
+        fundingSource === "balance"
+          ? "greed round started from internal balance"
+          : `greed round started from funded single-round intent${
+              fundedIntentId ? ` #${fundedIntentId}` : ""
+            }`,
+    });
+
+    const displayName = await getDisplayNameForAddress(address);
+
+    if (GREED_SPECTATOR_ENABLED && spectatorChatId) {
+      registerLiveRound({
+        roundId: Number(round.id),
+        address,
+        displayName,
+        wager: requestedWager,
+        fundedExactAmount: lockedWager,
+        chatId: spectatorChatId,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        safeClicks: 0,
+        isActive: true,
+      });
+
+      await sendGymSpectatorMessageToChat(
+        spectatorChatId,
+        [
+          `🍩 FEED YOUR GREED LIVE`,
+          ``,
+          `${displayName} just locked a round.`,
+          `Single round wager: ${formatAmount3(requestedWager)} PHAT`,
+          `Locked amount: ${formatAmount3(lockedWager)} PHAT`,
+          `Funding source: ${
+            fundingModeUsed === "internal_balance"
+              ? "Internal Balance"
+              : "Single Round Intent"
+          }`,
+          `Round ID: #${Number(round.id)}`,
+          ``,
+          `Pick your donut in chat before they do 👇`,
+          `${formatDonutBoardLine()}`,
+        ].join("\n"),
+        {
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+          ]).reply_markup,
+        }
+      );
+    }
+
+    return res.json({
+      ok: true,
+      roundId: round.id,
+      singleRoundWager: requestedWager,
+      requestedWager,
+      fundedExactAmount: lockedWager,
+      wager: lockedWager,
+      netStake,
+      totalTax,
+      devCut,
+      treasuryCut,
+      jackpotCut,
+      jackpotFeed,
+      fundingSource,
+      fundingModeUsed,
+      internalBalanceUsed: fundingModeUsed === "internal_balance",
+      singleRoundIntentUsed: fundingModeUsed === "single_round_intent",
+      totalDonuts: GREED_TOTAL_DONUTS,
+      poisonCount: GREED_POISON_COUNT,
+      currentMultiplier: 1.0,
+      cashoutAvailable: false,
+      fundedIntentId,
+      provablyFair: {
+        commitHash,
+        nonce,
+      },
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to start greed round" });
+  }
 });
 
 app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
@@ -2948,16 +3016,31 @@ app.post("/admin/deposit-credit", async (req: Request, res: Response) => {
     const address = String(req.body?.address || "").trim();
     const txSignature = String(req.body?.txSignature || "").trim();
     const senderWallet = String(req.body?.senderWallet || "").trim() || null;
-    const tokenMint = String(req.body?.tokenMint || "").trim() || null;
+    const tokenMint = String(req.body?.tokenMint || "").trim() || PHAT_TOKEN_MINT;
     const amount = parseAmount3(req.body?.amount);
-    const note = String(req.body?.note || "manual admin credit").trim();
+    const note = String(req.body?.note || "manual admin balance credit").trim();
 
-    if (!address) return res.status(400).json({ error: "Missing address" });
-    if (!txSignature) return res.status(400).json({ error: "Missing txSignature" });
-    if (amount == null || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+    const resolveUnmatched = String(req.body?.resolveUnmatched || "true").trim().toLowerCase() !== "false";
+    const resolutionStatus = String(req.body?.resolutionStatus || "resolved").trim() || "resolved";
+    const resolutionNote =
+      String(req.body?.resolutionNote || "").trim() || "admin manually credited deposit to user balance";
+
+    if (!address) {
+      return res.status(400).json({ error: "Missing address" });
+    }
+
+    if (!txSignature) {
+      return res.status(400).json({ error: "Missing txSignature" });
+    }
+
+    if (amount == null || amount <= 0) {
+      return res.status(400).json({ error: "Invalid amount" });
+    }
 
     const exists = await hasDepositTxSignature(txSignature);
-    if (exists) return res.status(400).json({ error: "Transaction already processed" });
+    if (exists) {
+      return res.status(400).json({ error: "Transaction already processed" });
+    }
 
     const dep = await recordDeposit({
       address,
@@ -2969,11 +3052,33 @@ app.post("/admin/deposit-credit", async (req: Request, res: Response) => {
       note,
     });
 
-    if (!dep) return res.status(400).json({ error: "Transaction already processed" });
+    if (!dep) {
+      return res.status(400).json({ error: "Transaction already processed" });
+    }
 
     await creditBalance({ address, amount });
 
-    return res.json({ ok: true, deposit: dep });
+    let unmatchedResolution: any = null;
+    if (resolveUnmatched) {
+      const existingUnmatched = await getGreedUnmatchedDepositBySignature(txSignature);
+      if (existingUnmatched && String(existingUnmatched.resolution_status || "") === "open") {
+        unmatchedResolution = await markGreedUnmatchedDepositResolved({
+          txSignature,
+          resolutionStatus,
+          resolutionNote,
+          matchedAddress: address,
+        });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      deposit: dep,
+      creditedBalanceAmount: amount,
+      unmatchedResolution: unmatchedResolution
+        ? serializeUnmatchedDeposit(unmatchedResolution)
+        : null,
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Deposit credit failed" });
@@ -3007,6 +3112,7 @@ app.post("/admin/greed/fund-intent", async (req: Request, res: Response) => {
       if (exactAmount == null) {
         return res.status(400).json({ error: "Missing exactAmount" });
       }
+
       intent = await findGreedIntentByExactAmountLocal({
         exactAmount,
         status: "pending",
@@ -3048,12 +3154,13 @@ app.post("/admin/greed/fund-intent", async (req: Request, res: Response) => {
       note: "greed intent funded",
     });
 
+    let unmatchedResolution: any = null;
     const existingUnmatched = await getGreedUnmatchedDepositBySignature(txSignature);
     if (existingUnmatched && String(existingUnmatched.resolution_status || "") === "open") {
-      await markGreedUnmatchedDepositResolved({
+      unmatchedResolution = await markGreedUnmatchedDepositResolved({
         txSignature,
         resolutionStatus: "resolved",
-        resolutionNote: "admin matched this deposit to a valid intent",
+        resolutionNote: "admin matched this deposit to a valid greed intent",
         matchedIntentId: Number(funded.id),
         matchedAddress: String(funded.address),
       });
@@ -3063,6 +3170,9 @@ app.post("/admin/greed/fund-intent", async (req: Request, res: Response) => {
       ok: true,
       intent: serializeGreedIntent(funded),
       deposit: dep,
+      unmatchedResolution: unmatchedResolution
+        ? serializeUnmatchedDeposit(unmatchedResolution)
+        : null,
     });
   } catch (e) {
     console.error(e);
@@ -3076,6 +3186,7 @@ app.get("/admin/greed/unmatched", async (req: Request, res: Response) => {
   try {
     const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
     const rows = await getOpenGreedUnmatchedDeposits(limit);
+
     return res.json({
       ok: true,
       count: rows.length,
@@ -3087,6 +3198,18 @@ app.get("/admin/greed/unmatched", async (req: Request, res: Response) => {
   }
 });
 
+app.get("/admin/greed/treasury", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const snapshot = await getGreedAdminTreasurySnapshot();
+    return res.json({ ok: true, snapshot });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch treasury snapshot" });
+  }
+});
+
 app.post("/admin/greed/unmatched/resolve", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -3095,7 +3218,9 @@ app.post("/admin/greed/unmatched/resolve", async (req: Request, res: Response) =
     const resolutionStatus = String(req.body?.resolutionStatus || "resolved").trim() || "resolved";
     const resolutionNote = String(req.body?.resolutionNote || "").trim() || null;
     const matchedIntentId =
-      req.body?.matchedIntentId == null ? null : Math.floor(Number(req.body.matchedIntentId || 0)) || null;
+      req.body?.matchedIntentId == null
+        ? null
+        : Math.floor(Number(req.body.matchedIntentId || 0)) || null;
     const matchedAddress = String(req.body?.matchedAddress || "").trim() || null;
 
     if (!txSignature) {
@@ -3129,7 +3254,10 @@ app.post("/admin/jackpot/reseed", async (req: Request, res: Response) => {
 
   try {
     const amount = parseAmount3(req.body?.amount ?? GREED_JACKPOT_RESEED);
-    const row = await setGreedJackpotAmount(amount == null ? GREED_JACKPOT_RESEED : amount);
+    const row = await setGreedJackpotAmount(
+      amount == null ? GREED_JACKPOT_RESEED : amount
+    );
+
     return res.json({ ok: true, jackpot: row });
   } catch (e) {
     console.error(e);
