@@ -950,6 +950,7 @@ export async function recordDeposit(params: {
 
   return r.rows[0] || null;
 }
+
 // -------------------------------
 // Greed deposit intent helpers
 // -------------------------------
@@ -1183,7 +1184,7 @@ export async function consumeFundedGreedDepositIntent(params: {
     UPDATE greed_deposit_intents
     SET
       status = 'consumed',
-      started_at = NOW(),
+      started_at = COALESCE(started_at, NOW()),
       updated_at = NOW()
     WHERE id = $1
       AND address = $2
@@ -1553,6 +1554,77 @@ export async function getGreedTreasuryTotals() {
     dev_cut: 0,
     treasury_cut: 0,
     jackpot_cut: 0,
+  };
+}
+
+export async function getGreedAdminTreasurySnapshot() {
+  const [depositsRes, withdrawalsRes, balancesRes, wageredRes, taxRes, jackpotRes] = await Promise.all([
+    pool.query(`
+      SELECT COALESCE(SUM(amount),0)::DOUBLE PRECISION AS total_deposits_credited
+      FROM deposits
+      WHERE status = 'credited';
+    `),
+    pool.query(`
+      SELECT COALESCE(SUM(amount),0)::DOUBLE PRECISION AS total_withdrawals_completed
+      FROM withdrawals
+      WHERE status = 'completed';
+    `),
+    pool.query(`
+      SELECT
+        COALESCE(SUM(available_balance),0)::DOUBLE PRECISION AS total_available_balances,
+        COALESCE(SUM(locked_balance),0)::DOUBLE PRECISION AS total_locked_balances,
+        (COALESCE(SUM(available_balance),0) + COALESCE(SUM(locked_balance),0))::DOUBLE PRECISION AS total_user_balances_owed
+      FROM balances;
+    `),
+    pool.query(`
+      SELECT COALESCE(SUM(wager),0)::DOUBLE PRECISION AS total_wagered
+      FROM greed_rounds
+      WHERE status = 'closed';
+    `),
+    pool.query(`
+      SELECT
+        COALESCE(SUM(total_tax),0)::DOUBLE PRECISION AS total_tax_collected,
+        COALESCE(SUM(dev_cut),0)::DOUBLE PRECISION AS dev_share_accrued,
+        COALESCE(SUM(treasury_cut),0)::DOUBLE PRECISION AS treasury_share_accrued,
+        COALESCE(SUM(jackpot_cut),0)::DOUBLE PRECISION AS jackpot_share_accrued
+      FROM greed_tax_ledger;
+    `),
+    pool.query(`
+      SELECT COALESCE(current_amount,0)::DOUBLE PRECISION AS current_jackpot_amount
+      FROM jackpot_state
+      WHERE key = 'greed'
+      LIMIT 1;
+    `),
+  ]);
+
+  const totalDepositsCredited = Number(depositsRes.rows?.[0]?.total_deposits_credited || 0);
+  const totalWithdrawalsCompleted = Number(withdrawalsRes.rows?.[0]?.total_withdrawals_completed || 0);
+  const totalAvailableBalances = Number(balancesRes.rows?.[0]?.total_available_balances || 0);
+  const totalLockedBalances = Number(balancesRes.rows?.[0]?.total_locked_balances || 0);
+  const totalUserBalancesOwed = Number(balancesRes.rows?.[0]?.total_user_balances_owed || 0);
+  const totalWagered = Number(wageredRes.rows?.[0]?.total_wagered || 0);
+  const totalTaxCollected = Number(taxRes.rows?.[0]?.total_tax_collected || 0);
+  const devShareAccrued = Number(taxRes.rows?.[0]?.dev_share_accrued || 0);
+  const treasuryShareAccrued = Number(taxRes.rows?.[0]?.treasury_share_accrued || 0);
+  const jackpotShareAccrued = Number(taxRes.rows?.[0]?.jackpot_share_accrued || 0);
+  const currentJackpotAmount = Number(jackpotRes.rows?.[0]?.current_jackpot_amount || 0);
+
+  const estimatedFreeTreasuryBuffer =
+    totalDepositsCredited - totalWithdrawalsCompleted - totalUserBalancesOwed;
+
+  return {
+    totalDepositsCredited,
+    totalWithdrawalsCompleted,
+    totalAvailableBalances,
+    totalLockedBalances,
+    totalUserBalancesOwed,
+    totalWagered,
+    totalTaxCollected,
+    devShareAccrued,
+    treasuryShareAccrued,
+    jackpotShareAccrued,
+    currentJackpotAmount,
+    estimatedFreeTreasuryBuffer,
   };
 }
 
@@ -1927,7 +1999,7 @@ export async function getGreedLeaderboard(params: {
       ORDER BY value DESC
       LIMIT $1;
     `;
-   } else if (params.board === "most_won") {
+  } else if (params.board === "most_won") {
     sql = `
       SELECT
         gr.address,
