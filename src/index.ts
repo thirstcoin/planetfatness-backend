@@ -269,13 +269,22 @@ function asGameKey(x: unknown): GameKey {
 }
 
 function asGreedIntentType(x: unknown): GreedIntentType {
-  return String(x || "").trim().toLowerCase() === "balance_fund" ? "balance_fund" : "single_round";
-}
+  const v = String(x || "").trim().toLowerCase();
 
+  if (
+    v === "balance_fund" ||
+    v === "balance_deposit" ||
+    v === "deposit_balance" ||
+    v === "balance"
+  ) {
+    return "balance_fund";
+  }
+
+  return "single_round";
+}
 function nowIso() {
   return new Date().toISOString();
 }
-
 function normalizeWindow(w: unknown): "lifetime" | "day" | "week" | "month" {
   const s = String(w || "lifetime").toLowerCase().trim();
   if (s === "daily") return "day";
