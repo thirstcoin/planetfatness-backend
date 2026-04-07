@@ -1616,8 +1616,8 @@ const GREED_MAX_WAGER = 50000;
 const GREED_MAX_BALANCE_FUND = 250000;
 const GREED_TOTAL_DONUTS = 12;
 const GREED_POISON_COUNT = 2;
-const GREED_JACKPOT_RESEED = 5000;
-const GREED_MULTIPLIERS = [1.02, 1.07, 1.15, 1.30, 1.48, 1.70, 1.98, 2.28, 2.70, 3.50];
+const GREED_JACKPOT_RESEED = 25000;
+const GREED_MULTIPLIERS = [1.10, 1.24, 1.40, 1.58, 1.80, 2.08, 2.42, 2.85, 3.50, 5.00];
 
 function getGreedMultiplierForSafeClicks(safeClicks: number) {
   if (safeClicks <= 0) return 1.0;
@@ -2271,7 +2271,12 @@ app.post("/greed/deposit-intent/:id/cancel", requireAuth, async (req: Request, r
 // -------------------------------
 app.get("/greed/jackpot", async (_req: Request, res: Response) => {
   try {
-    const row = await getGreedJackpotState();
+    let row = await getGreedJackpotState();
+
+    if (!row || Number(row.current_amount || 0) < GREED_JACKPOT_RESEED) {
+      row = await setGreedJackpotAmount(GREED_JACKPOT_RESEED);
+    }
+
     return res.json({ ok: true, jackpot: row });
   } catch (e) {
     console.error(e);
@@ -2732,7 +2737,10 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
       }
 
       await creditBalance({ address, amount: totalPayout });
-      await reseedGreedJackpot();
+
+// reset jackpot cleanly to new 25k floor
+await reseedGreedJackpot();
+await setGreedJackpotAmount(GREED_JACKPOT_RESEED);
 
       await logSession({
         address,
