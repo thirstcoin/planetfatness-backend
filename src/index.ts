@@ -3563,7 +3563,14 @@ const gymBot = new Telegraf(process.env.TG_BOT_TOKEN || "");
 gymBot.start(async (ctx) => {
   try {
     await ctx.reply(
-      "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app.",
+      [
+        "🏋️ PLANET FATNESS GYM",
+        "",
+        "Tap below to open the gym hub or launch Feed Your Greed.",
+        "",
+        "Use /gym for the full gym hub.",
+        "Use /greed for Feed Your Greed.",
+      ].join("\n"),
       Markup.inlineKeyboard([
         [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
         [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
@@ -3572,7 +3579,27 @@ gymBot.start(async (ctx) => {
   } catch (e) {
     console.error("GYM /start button error:", e);
     try {
-      await ctx.reply("🏋️ Welcome back to Planet Fatness Gym!");
+      await ctx.reply("🏋️ PLANET FATNESS GYM\nUse /gym or /greed");
+    } catch {}
+  }
+});
+
+gymBot.command("gym", async (ctx) => {
+  try {
+    await ctx.reply(
+      [
+        "🏋️ PLANET FATNESS GYM",
+        "",
+        "Open the gym hub to access all games, your gym card, and leaderboards.",
+      ].join("\n"),
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
+      ])
+    );
+  } catch (e) {
+    console.error("GYM /gym button error:", e);
+    try {
+      await ctx.reply("🏋️ Open Planet Fatness Gym");
     } catch {}
   }
 });
@@ -3580,11 +3607,20 @@ gymBot.start(async (ctx) => {
 gymBot.command("greed", async (ctx) => {
   try {
     await ctx.reply(
-      "🍩 Feed Your Greed is live.\nTap below to open the official game.",
-      Markup.inlineKeyboard([[Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]])
+      [
+        "🍩 FEED YOUR GREED",
+        "",
+        "Lock a round. Avoid the poison. Cash out or chase the jackpot.",
+      ].join("\n"),
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+      ])
     );
   } catch (e) {
     console.error("GYM /greed button error:", e);
+    try {
+      await ctx.reply("🍩 Open Feed Your Greed");
+    } catch {}
   }
 });
 
