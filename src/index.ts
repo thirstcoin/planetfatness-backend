@@ -3611,7 +3611,12 @@ gymBot.command("greed", async (ctx) => {
       [
         "🍩 FEED YOUR GREED",
         "",
-        "Fund your balance, pick safe donuts, cash out, or push for the jackpot.",
+        "Fund. Pick. Cash out — or get wiped.",
+        "",
+        "12 donuts. 2 poison.",
+        "Multipliers climb every click.",
+        "",
+        "Play smart or chase the jackpot 👇",
       ].join("\n"),
       Markup.inlineKeyboard([
         [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
