@@ -3566,10 +3566,11 @@ gymBot.start(async (ctx) => {
       [
         "🏋️ PLANET FATNESS GYM",
         "",
-        "Tap below to open the gym hub or launch Feed Your Greed.",
+        "Open the gym hub or launch Feed Your Greed below.",
         "",
         "Use /gym for the full gym hub.",
-        "Use /greed for Feed Your Greed.",
+        "Use /greed to open Feed Your Greed.",
+        "Use /greedguide for the quick how-to.",
       ].join("\n"),
       Markup.inlineKeyboard([
         [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
@@ -3579,7 +3580,7 @@ gymBot.start(async (ctx) => {
   } catch (e) {
     console.error("GYM /start button error:", e);
     try {
-      await ctx.reply("🏋️ PLANET FATNESS GYM\nUse /gym or /greed");
+      await ctx.reply("🏋️ PLANET FATNESS GYM\nUse /gym, /greed, or /greedguide");
     } catch {}
   }
 });
@@ -3610,7 +3611,7 @@ gymBot.command("greed", async (ctx) => {
       [
         "🍩 FEED YOUR GREED",
         "",
-        "Lock a round. Avoid the poison. Cash out or chase the jackpot.",
+        "Fund your balance, pick safe donuts, cash out, or push for the jackpot.",
       ].join("\n"),
       Markup.inlineKeyboard([
         [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
@@ -3624,6 +3625,47 @@ gymBot.command("greed", async (ctx) => {
   }
 });
 
+gymBot.command("greedguide", async (ctx) => {
+  try {
+    await ctx.reply(
+      [
+        "🍩 FEED YOUR GREED — QUICK GUIDE",
+        "",
+        "Choose your wager or use a preset.",
+        "",
+        "When funding is needed, you will get a wallet and a specific PHAT amount to send.",
+        "",
+        "Send that exact amount to that exact wallet.",
+        "",
+        "Do not round it.",
+        "Do not change it.",
+        "Do not send to a different wallet.",
+        "",
+        "If it matches exactly, your account gets credited and play unlocks.",
+        "",
+        "After your account is credited, the game defaults to a 1,000 PHAT wager.",
+        "You can keep that or choose any higher wager your balance covers.",
+        "",
+        "12 donuts.",
+        "2 are poison.",
+        "Every safe pick raises the multiplier.",
+        "Cash out after 1 safe pick or push for the full clear.",
+        "",
+        "Flow:",
+        "Fund balance → account gets credited → wager defaults in → raise it if you want → run it",
+      ].join("\n"),
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+      ])
+    );
+  } catch (e) {
+    console.error("GYM /greedguide error:", e);
+    try {
+      await ctx.reply("🍩 Use /greed to play Feed Your Greed.");
+    } catch {}
+  }
+});
+
 gymBot.command("greedlive", async (ctx) => {
   try {
     await ctx.reply(
@@ -3631,7 +3673,9 @@ gymBot.command("greedlive", async (ctx) => {
         "🍩 FEED YOUR GREED LIVE",
         "Watch the next degen lock a round and scream your donut pick in chat.",
       ].join("\n"),
-      Markup.inlineKeyboard([[Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]])
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+      ])
     );
   } catch (e) {
     console.error("GYM /greedlive button error:", e);
@@ -3694,7 +3738,9 @@ gymBot.command("greedcard", async (ctx) => {
 
     await ctx.reply(
       msg,
-      Markup.inlineKeyboard([[Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]])
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+      ])
     );
   } catch (e) {
     console.error("GYM /greedcard error:", e);
