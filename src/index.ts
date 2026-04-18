@@ -3702,9 +3702,7 @@ gymBot.command("greedguide", async (ctx) => {
         "Flow:",
         "Deposit → balance updates → choose wager → run it",
       ].join("\n"),
-      Markup.inlineKeyboard([
-        [Markup.button.webApp("🍩 Play Feed Your Greed", GREED_WEBAPP_URL)],
-      ])
+      greedLaunchKeyboard(ctx)
     );
   } catch (e) {
     console.error("GYM /greedguide error:", e);
@@ -3721,9 +3719,7 @@ gymBot.command("greedlive", async (ctx) => {
         "🍩 FEED YOUR GREED LIVE",
         "Watch the next degen lock a round and scream your donut pick in chat.",
       ].join("\n"),
-      Markup.inlineKeyboard([
-        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-      ])
+      greedLaunchKeyboard(ctx)
     );
   } catch (e) {
     console.error("GYM /greedlive button error:", e);
