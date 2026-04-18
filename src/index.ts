@@ -2532,32 +2532,30 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
         isActive: true,
       });
 
-           await sendGymSpectatorMessageToChat(
-        spectatorChatId,
-        [
-          `🍩 FEED YOUR GREED LIVE`,
-          ``,
-          `${displayName} just locked a round.`,
-          `Single round wager: ${formatAmount3(requestedWager)} PHAT`,
-          `Locked amount: ${formatAmount3(lockedWager)} PHAT`,
-          `Funding source: ${
-            fundingModeUsed === "internal_balance"
-              ? "Internal Balance"
-              : "Single Round Intent"
-          }`,
-          `Round ID: #${Number(round.id)}`,
-          ``,
-          `Pick your donut in chat before they do 👇`,
-          `${formatDonutBoardLine()}`,
-        ].join("\n"),
-       {
+await sendGymSpectatorMessageToChat(
+  spectatorChatId,
+  [
+    `🍩 FEED YOUR GREED LIVE`,
+    ``,
+    `${displayName} just locked a round.`,
+    `Single round wager: ${formatAmount3(requestedWager)} PHAT`,
+    `Locked amount: ${formatAmount3(lockedWager)} PHAT`,
+    `Funding source: ${
+      fundingModeUsed === "internal_balance"
+        ? "Internal Balance"
+        : "Single Round Intent"
+    }`,
+    `Round ID: #${Number(round.id)}`,
+    ``,
+    `Pick your donut in chat before they do 👇`,
+    `${formatDonutBoardLine()}`,
+  ].join("\n"),
   {
-  reply_markup: greedLaunchReplyMarkup(
-    spectatorChatId ? "group" : "private"
-  ),
-}
+    reply_markup: greedLaunchReplyMarkup(
+      spectatorChatId ? "group" : "private"
+    ),
+  }
 );
-    }
 
     return res.json({
       ok: true,
