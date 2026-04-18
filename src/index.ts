@@ -3462,6 +3462,45 @@ app.get("/admin/launch-reset", async (req: Request, res: Response) => {
   }
 });
 
+function isPrivateChat(ctx: any) {
+  return ctx?.chat?.type === "private";
+}
+
+function gymLaunchKeyboard(ctx: any) {
+  return Markup.inlineKeyboard([
+    [
+      isPrivateChat(ctx)
+        ? Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)
+        : Markup.button.url("Open Planet Fatness Gym", HUB_WEBAPP_URL),
+    ],
+  ]);
+}
+
+function greedLaunchKeyboard(ctx: any) {
+  return Markup.inlineKeyboard([
+    [
+      isPrivateChat(ctx)
+        ? Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)
+        : Markup.button.url("Open Feed Your Greed", GREED_WEBAPP_URL),
+    ],
+  ]);
+}
+
+function startLaunchKeyboard(ctx: any) {
+  return Markup.inlineKeyboard([
+    [
+      isPrivateChat(ctx)
+        ? Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)
+        : Markup.button.url("Open Planet Fatness Gym", HUB_WEBAPP_URL),
+    ],
+    [
+      isPrivateChat(ctx)
+        ? Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)
+        : Markup.button.url("Open Feed Your Greed", GREED_WEBAPP_URL),
+    ],
+  ]);
+}
+
 // -------------------------------
 // Telegram game launch
 // -------------------------------
