@@ -3541,97 +3541,8 @@ function greedLaunchReplyMarkup(chatType?: string) {
 // -------------------------------
 // Telegram game launch
 // -------------------------------
-const bot = new Telegraf(process.env.GREED_BOT_TOKEN || "");
-
-bot.command("game", async (ctx) => {
-  try {
-    await ctx.reply(
-      "🍩 Feed Your Greed is live.\nTap below to open the official game.",
-      greedLaunchKeyboard(ctx)
-    );
-  } catch (e) {
-    console.error("GREED /game button error:", e);
-    try {
-      await ctx.replyWithGame(TG_GAME_SHORT_NAME);
-    } catch (inner) {
-      console.error("GREED fallback replyWithGame error:", inner);
-    }
-  }
-});
-
-bot.start(async (ctx) => {
-  try {
-    await ctx.reply(
-      "🍩 Feed Your Greed is live.\nTap below to open the official game.",
-      greedLaunchKeyboard(ctx)
-    );
-  } catch (e) {
-    console.error("GREED /start button error:", e);
-  }
-});
-
-bot.on("callback_query", async (ctx) => {
-  try {
-    const q = ctx.callbackQuery;
-    if (!q || !("game_short_name" in q)) return;
-
-    const user: any = ctx.from;
-    const tgIdNum = Number(user?.id || 0);
-    const username = user?.username ? String(user.username) : "";
-    const firstName = user?.first_name ? String(user.first_name) : "";
-    const lastName = user?.last_name ? String(user.last_name) : "";
-
-    if (!tgIdNum) {
-      await ctx.answerGameQuery(GREED_WEBAPP_URL);
-      return;
-    }
-
-    const address = `tg:${tgIdNum}`;
-
-    try {
-      await upsertUser(address);
-      await setTelegramIdentity({
-        address,
-        tgId: tgIdNum,
-        tgUsername: username || null,
-        firstName: firstName || null,
-        lastName: lastName || null,
-      });
-
-      const displayName =
-        (username ? `@${username}` : "") ||
-        ([firstName, lastName].filter(Boolean).join(" ").trim().slice(0, 24)) ||
-        "Member";
-
-      if (displayName && displayName.trim().length >= 2) {
-        try {
-          await setDisplayName({ address, displayName });
-        } catch {}
-      }
-    } catch (e) {
-      console.error("TG game upsert/identity failed:", e);
-      await ctx.answerGameQuery(GREED_WEBAPP_URL);
-      return;
-    }
-
-    let token = "";
-    try {
-      token = signTokenForAddress(address);
-    } catch (e) {
-      console.error("TG game signToken failed:", e);
-      await ctx.answerGameQuery(GREED_WEBAPP_URL);
-      return;
-    }
-
-    const launchUrl = `${GREED_WEBAPP_URL}?t=${encodeURIComponent(token)}`;
-    await ctx.answerGameQuery(launchUrl);
-  } catch (e) {
-    console.error("TG game callback handler error:", e);
-    try {
-      await ctx.answerGameQuery(GREED_WEBAPP_URL);
-    } catch {}
-  }
-});
+// Separate Greed bot removed.
+// Planet Fatness Gym bot handles all launches.
 
 // Main gym bot
 const gymBot = new Telegraf(process.env.TG_BOT_TOKEN || "");
@@ -3866,11 +3777,7 @@ gymBot.on("callback_query", async (ctx) => {
 try {
   await initDb();
 
-  if (process.env.GREED_BOT_TOKEN) {
-    bot.launch().then(() => console.log("🤖 Planet Fatness Greed Bot Engine Active"));
-  } else {
-    console.warn("⚠️ No GREED_BOT_TOKEN found in environment.");
-  }
+  // Greed bot disabled — using only Planet Fatness Gym bot
 
   if (process.env.TG_BOT_TOKEN) {
     gymBot.launch().then(() => console.log("🤖 Planet Fatness Gym Bot Engine Active"));
