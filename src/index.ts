@@ -596,11 +596,9 @@ async function sendMeaningfulGreedFeed(params: {
   if (!process.env.TG_BOT_TOKEN) return;
 
   try {
-    await sendGymSpectatorMessage(params.message, {
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-      ]).reply_markup,
-    });
+   await sendGymSpectatorMessage(params.message, {
+  reply_markup: greedLaunchReplyMarkup("group"),
+});
   } catch (e) {
     console.error("Meaningful greed feed failed:", e);
   }
@@ -2552,10 +2550,8 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
           `${formatDonutBoardLine()}`,
         ].join("\n"),
         {
-          reply_markup: Markup.inlineKeyboard([
-            [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-          ]).reply_markup,
-        }
+  reply_markup: greedLaunchReplyMarkup("group"),
+}
       );
     }
 
@@ -3501,6 +3497,16 @@ function startLaunchKeyboard(ctx: any) {
   ]);
 }
 
+function greedLaunchReplyMarkup(chatType?: string) {
+  return Markup.inlineKeyboard([
+    [
+      chatType === "private"
+        ? Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)
+        : Markup.button.url("Open Feed Your Greed", GREED_WEBAPP_URL),
+    ],
+  ]).reply_markup;
+}
+
 // -------------------------------
 // Telegram game launch
 // -------------------------------
@@ -3510,7 +3516,7 @@ bot.command("game", async (ctx) => {
   try {
     await ctx.reply(
       "🍩 Feed Your Greed is live.\nTap below to open the official game.",
-      Markup.inlineKeyboard([[Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]])
+      greedLaunchKeyboard(ctx)
     );
   } catch (e) {
     console.error("GREED /game button error:", e);
@@ -3526,7 +3532,7 @@ bot.start(async (ctx) => {
   try {
     await ctx.reply(
       "🍩 Feed Your Greed is live.\nTap below to open the official game.",
-      Markup.inlineKeyboard([[Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)]])
+      greedLaunchKeyboard(ctx)
     );
   } catch (e) {
     console.error("GREED /start button error:", e);
@@ -3652,9 +3658,7 @@ gymBot.command("greed", async (ctx) => {
         "",
         "Play smart or chase the jackpot 👇",
       ].join("\n"),
-      Markup.inlineKeyboard([
-        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-      ])
+      greedLaunchKeyboard(ctx)
     );
   } catch (e) {
     console.error("GYM /greed button error:", e);
@@ -3781,11 +3785,9 @@ gymBot.command("greedcard", async (ctx) => {
     ].join("\n");
 
     await ctx.reply(
-      msg,
-      Markup.inlineKeyboard([
-        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-      ])
-    );
+  msg,
+  greedLaunchKeyboard(ctx)
+);
   } catch (e) {
     console.error("GYM /greedcard error:", e);
     try {
