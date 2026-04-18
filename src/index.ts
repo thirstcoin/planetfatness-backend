@@ -2551,10 +2551,9 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
           `${formatDonutBoardLine()}`,
         ].join("\n"),
        {
+  {
   reply_markup: greedLaunchReplyMarkup(
-    liveState?.chatId && String(liveState.chatId) === String(GREED_SPECTATOR_CHAT_ID)
-      ? "group"
-      : "private"
+    spectatorChatId ? "group" : "private"
   ),
 }
 );
