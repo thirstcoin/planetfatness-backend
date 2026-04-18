@@ -2555,8 +2555,8 @@ await sendGymSpectatorMessageToChat(
       spectatorChatId ? "group" : "private"
     ),
   }
-);
-
+ );
+}
     return res.json({
       ok: true,
       roundId: round.id,
