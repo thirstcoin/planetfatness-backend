@@ -3632,9 +3632,7 @@ gymBot.command("gym", async (ctx) => {
         "",
         "Open the gym hub to access all games, your gym card, and leaderboards.",
       ].join("\n"),
-      Markup.inlineKeyboard([
-        [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
-      ])
+      gymLaunchKeyboard(ctx)
     );
   } catch (e) {
     console.error("GYM /gym button error:", e);
