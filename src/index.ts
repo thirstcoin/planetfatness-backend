@@ -3587,10 +3587,7 @@ gymBot.start(async (ctx) => {
   try {
     await ctx.reply(
       "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app.",
-      Markup.inlineKeyboard([
-        [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
-        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-      ])
+      startLaunchKeyboard(ctx)
     );
   } catch (e) {
     console.error("GYM /start button error:", e);
@@ -3604,10 +3601,7 @@ gymBot.command("gym", async (ctx) => {
   try {
     await ctx.reply(
       "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app.",
-      Markup.inlineKeyboard([
-        [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
-        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-      ])
+      gymLaunchKeyboard(ctx)
     );
   } catch (e) {
     console.error("GYM /gym button error:", e);
