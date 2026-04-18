@@ -3602,20 +3602,17 @@ const gymBot = new Telegraf(process.env.TG_BOT_TOKEN || "");
 gymBot.start(async (ctx) => {
   try {
     await ctx.reply(
-      [
-        "🏋️ PLANET FATNESS GYM",
-        "",
-        "Open the gym hub or launch Feed Your Greed below.",
-        "",
-        "Use /gym for the full gym hub.",
-        "Use /greed to open Feed Your Greed.",
-        "Use /greedguide for the quick how-to.",
-      ].join("\n"),
-      Markup.inlineKeyboard([
-        [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
-        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-      ])
-    );
+  [
+    "🏋️ PLANET FATNESS GYM",
+    "",
+    "Open the gym hub or launch Feed Your Greed below.",
+    "",
+    "Use /gym for the full gym hub.",
+    "Use /greed to open Feed Your Greed.",
+    "Use /greedguide for the quick how-to.",
+  ].join("\n"),
+  startLaunchKeyboard(ctx)
+);
   } catch (e) {
     console.error("GYM /start button error:", e);
     try {
