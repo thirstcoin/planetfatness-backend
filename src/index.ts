@@ -596,9 +596,9 @@ async function sendMeaningfulGreedFeed(params: {
   if (!process.env.TG_BOT_TOKEN) return;
 
   try {
-   await sendGymSpectatorMessage(params.message, {
-  reply_markup: greedLaunchReplyMarkup("group"),
-});
+    await sendGymSpectatorMessage(params.message, {
+      reply_markup: greedLaunchReplyMarkup("private"),
+    });
   } catch (e) {
     console.error("Meaningful greed feed failed:", e);
   }
@@ -2531,7 +2531,7 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
         isActive: true,
       });
 
-      await sendGymSpectatorMessageToChat(
+           await sendGymSpectatorMessageToChat(
         spectatorChatId,
         [
           `🍩 FEED YOUR GREED LIVE`,
@@ -2550,8 +2550,8 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
           `${formatDonutBoardLine()}`,
         ].join("\n"),
         {
-  reply_markup: greedLaunchReplyMarkup("group"),
-}
+          reply_markup: greedLaunchReplyMarkup("private"),
+        }
       );
     }
 
@@ -3462,48 +3462,28 @@ function isPrivateChat(ctx: any) {
   return ctx?.chat?.type === "private";
 }
 
-function gymLaunchKeyboard(ctx: any) {
+function gymLaunchKeyboard(_ctx: any) {
   return Markup.inlineKeyboard([
-    [
-      isPrivateChat(ctx)
-        ? Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)
-        : Markup.button.url("Open Planet Fatness Gym", HUB_WEBAPP_URL),
-    ],
+    [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
   ]);
 }
 
-function greedLaunchKeyboard(ctx: any) {
+function greedLaunchKeyboard(_ctx: any) {
   return Markup.inlineKeyboard([
-    [
-      isPrivateChat(ctx)
-        ? Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)
-        : Markup.button.url("Open Feed Your Greed", GREED_WEBAPP_URL),
-    ],
+    [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
   ]);
 }
 
-function startLaunchKeyboard(ctx: any) {
+function startLaunchKeyboard(_ctx: any) {
   return Markup.inlineKeyboard([
-    [
-      isPrivateChat(ctx)
-        ? Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)
-        : Markup.button.url("Open Planet Fatness Gym", HUB_WEBAPP_URL),
-    ],
-    [
-      isPrivateChat(ctx)
-        ? Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)
-        : Markup.button.url("Open Feed Your Greed", GREED_WEBAPP_URL),
-    ],
+    [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
+    [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
   ]);
 }
 
-function greedLaunchReplyMarkup(chatType?: string) {
+function greedLaunchReplyMarkup(_chatType?: string) {
   return Markup.inlineKeyboard([
-    [
-      chatType === "private"
-        ? Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)
-        : Markup.button.url("Open Feed Your Greed", GREED_WEBAPP_URL),
-    ],
+    [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
   ]).reply_markup;
 }
 
@@ -3608,17 +3588,17 @@ const gymBot = new Telegraf(process.env.TG_BOT_TOKEN || "");
 gymBot.start(async (ctx) => {
   try {
     await ctx.reply(
-  [
-    "🏋️ PLANET FATNESS GYM",
-    "",
-    "Open the gym hub or launch Feed Your Greed below.",
-    "",
-    "Use /gym for the full gym hub.",
-    "Use /greed to open Feed Your Greed.",
-    "Use /greedguide for the quick how-to.",
-  ].join("\n"),
-  startLaunchKeyboard(ctx)
-);
+      [
+        "🏋️ PLANET FATNESS GYM",
+        "",
+        "Open the gym hub or launch Feed Your Greed below.",
+        "",
+        "Use /gym for the full gym hub.",
+        "Use /greed to open Feed Your Greed.",
+        "Use /greedguide for the quick how-to.",
+      ].join("\n"),
+      startLaunchKeyboard(ctx)
+    );
   } catch (e) {
     console.error("GYM /start button error:", e);
     try {
@@ -3784,10 +3764,10 @@ gymBot.command("greedcard", async (ctx) => {
       `Greed Score ${formatAmount3(stats.greed_score)}`,
     ].join("\n");
 
-    await ctx.reply(
-  msg,
-  greedLaunchKeyboard(ctx)
-);
+        await ctx.reply(
+      msg,
+      greedLaunchKeyboard(ctx)
+    );
   } catch (e) {
     console.error("GYM /greedcard error:", e);
     try {
