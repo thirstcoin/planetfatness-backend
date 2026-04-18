@@ -104,6 +104,7 @@ const TG_GAME_SHORT_NAME = String(process.env.TG_GAME_SHORT_NAME || "planetfatne
 const ADMIN_SECRET = String(process.env.ADMIN_SECRET || "launch2026").trim();
 const GREED_WEBAPP_URL = String(process.env.GREED_WEBAPP_URL || "https://planetfatness.fit/greed").trim();
 const HUB_WEBAPP_URL = String(process.env.HUB_WEBAPP_URL || "https://planetfatness.fit/").trim();
+const TG_BOT_USERNAME = String(process.env.TG_BOT_USERNAME || "").trim().replace(/^@/, "");
 
 const DEPOSIT_WALLET = String(process.env.DEPOSIT_WALLET || "").trim();
 const PHAT_TOKEN_ACCOUNT = String(process.env.PHAT_TOKEN_ACCOUNT || "").trim();
@@ -597,7 +598,7 @@ async function sendMeaningfulGreedFeed(params: {
 
   try {
     await sendGymSpectatorMessage(params.message, {
-      reply_markup: greedLaunchReplyMarkup("private"),
+      reply_markup: greedLaunchReplyMarkup("group"),
     });
   } catch (e) {
     console.error("Meaningful greed feed failed:", e);
@@ -2549,10 +2550,14 @@ app.post("/greed/start", requireAuth, async (req: Request, res: Response) => {
           `Pick your donut in chat before they do 👇`,
           `${formatDonutBoardLine()}`,
         ].join("\n"),
-        {
-          reply_markup: greedLaunchReplyMarkup("private"),
-        }
-      );
+       {
+  reply_markup: greedLaunchReplyMarkup(
+    liveState?.chatId && String(liveState.chatId) === String(GREED_SPECTATOR_CHAT_ID)
+      ? "group"
+      : "private"
+  ),
+}
+);
     }
 
     return res.json({
@@ -3462,24 +3467,75 @@ function isPrivateChat(ctx: any) {
   return ctx?.chat?.type === "private";
 }
 
-function gymLaunchKeyboard(_ctx: any) {
+function getBotUsername(ctx: any) {
+  const fromCtx = String(ctx?.botInfo?.username || "").trim().replace(/^@/, "");
+  return fromCtx || TG_BOT_USERNAME || "";
+}
+
+function buildBotDeepLink(ctx: any, startParam: string) {
+  const username = getBotUsername(ctx);
+  if (!username) return null;
+  return `https://t.me/${username}?start=${encodeURIComponent(startParam)}`;
+}
+
+function gymLaunchKeyboard(ctx: any) {
+  const privateChat = isPrivateChat(ctx);
+  const greedDmLink = buildBotDeepLink(ctx, "greed");
+
+  if (!privateChat) {
+    const rows: any[] = [
+      [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
+      [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+    ];
+
+    if (greedDmLink) {
+      rows.push([Markup.button.url("Open Greed in DM", greedDmLink)]);
+    }
+
+    return Markup.inlineKeyboard(rows);
+  }
+
   return Markup.inlineKeyboard([
     [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
     [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
   ]);
 }
 
-function greedLaunchKeyboard(_ctx: any) {
+function greedLaunchKeyboard(ctx: any) {
+  const privateChat = isPrivateChat(ctx);
+  const greedDmLink = buildBotDeepLink(ctx, "greed");
+
+  if (!privateChat) {
+    const rows: any[] = [
+      [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+    ];
+
+    if (greedDmLink) {
+      rows.push([Markup.button.url("Open in DM", greedDmLink)]);
+    }
+
+    return Markup.inlineKeyboard(rows);
+  }
+
   return Markup.inlineKeyboard([
     [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
   ]);
 }
 
-function startLaunchKeyboard(_ctx: any) {
-  return gymLaunchKeyboard(_ctx);
+function startLaunchKeyboard(ctx: any) {
+  return gymLaunchKeyboard(ctx);
 }
 
-function greedLaunchReplyMarkup(_chatType?: string) {
+function greedLaunchReplyMarkup(chatType?: string) {
+  const privateChat = chatType === "private";
+
+  if (!privateChat && TG_BOT_USERNAME) {
+    return Markup.inlineKeyboard([
+      [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+      [Markup.button.url("Open in DM", `https://t.me/${TG_BOT_USERNAME}?start=greed`)],
+    ]).reply_markup;
+  }
+
   return Markup.inlineKeyboard([
     [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
   ]).reply_markup;
@@ -3585,6 +3641,26 @@ const gymBot = new Telegraf(process.env.TG_BOT_TOKEN || "");
 
 gymBot.start(async (ctx) => {
   try {
+    const rawText = String(ctx.message?.text || "").trim().toLowerCase();
+    const isGreedDeepLink = rawText.includes("greed");
+
+    if (isGreedDeepLink) {
+      await ctx.reply(
+        [
+          "🍩 FEED YOUR GREED",
+          "",
+          "Fund. Pick. Cash out — or get wiped.",
+          "",
+          "12 donuts. 2 poison.",
+          "Multipliers climb every click.",
+          "",
+          "Tap below to launch the game.",
+        ].join("\n"),
+        greedLaunchKeyboard(ctx)
+      );
+      return;
+    }
+
     await ctx.reply(
       "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app.",
       startLaunchKeyboard(ctx)
@@ -3600,7 +3676,9 @@ gymBot.start(async (ctx) => {
 gymBot.command("gym", async (ctx) => {
   try {
     await ctx.reply(
-      "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app.",
+      isPrivateChat(ctx)
+        ? "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app."
+        : "🏋️ Open the gym below. Greed also has a backup DM launcher if Telegram acts weird in group.",
       gymLaunchKeyboard(ctx)
     );
   } catch (e) {
@@ -3622,7 +3700,9 @@ gymBot.command("greed", async (ctx) => {
         "12 donuts. 2 poison.",
         "Multipliers climb every click.",
         "",
-        "Play smart or chase the jackpot 👇",
+        isPrivateChat(ctx)
+          ? "Tap below to launch the game."
+          : "Tap below to launch now, or use the DM backup if Telegram gets weird in group.",
       ].join("\n"),
       greedLaunchKeyboard(ctx)
     );
