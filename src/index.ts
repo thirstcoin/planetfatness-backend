@@ -3465,6 +3465,7 @@ function isPrivateChat(ctx: any) {
 function gymLaunchKeyboard(_ctx: any) {
   return Markup.inlineKeyboard([
     [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
+    [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
   ]);
 }
 
@@ -3475,10 +3476,7 @@ function greedLaunchKeyboard(_ctx: any) {
 }
 
 function startLaunchKeyboard(_ctx: any) {
-  return Markup.inlineKeyboard([
-    [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
-    [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-  ]);
+  return gymLaunchKeyboard(_ctx);
 }
 
 function greedLaunchReplyMarkup(_chatType?: string) {
@@ -3588,21 +3586,16 @@ const gymBot = new Telegraf(process.env.TG_BOT_TOKEN || "");
 gymBot.start(async (ctx) => {
   try {
     await ctx.reply(
-      [
-        "🏋️ PLANET FATNESS GYM",
-        "",
-        "Open the gym hub or launch Feed Your Greed below.",
-        "",
-        "Use /gym for the full gym hub.",
-        "Use /greed to open Feed Your Greed.",
-        "Use /greedguide for the quick how-to.",
-      ].join("\n"),
-      startLaunchKeyboard(ctx)
+      "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app.",
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+      ])
     );
   } catch (e) {
     console.error("GYM /start button error:", e);
     try {
-      await ctx.reply("🏋️ PLANET FATNESS GYM\nUse /gym, /greed, or /greedguide");
+      await ctx.reply("🏋️ Welcome back to Planet Fatness Gym!");
     } catch {}
   }
 });
@@ -3610,17 +3603,16 @@ gymBot.start(async (ctx) => {
 gymBot.command("gym", async (ctx) => {
   try {
     await ctx.reply(
-      [
-        "🏋️ PLANET FATNESS GYM",
-        "",
-        "Open the gym hub to access all games, your gym card, and leaderboards.",
-      ].join("\n"),
-      gymLaunchKeyboard(ctx)
+      "🏋️ Welcome back to Planet Fatness Gym! Tap below to open the app.",
+      Markup.inlineKeyboard([
+        [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
+        [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+      ])
     );
   } catch (e) {
     console.error("GYM /gym button error:", e);
     try {
-      await ctx.reply("🏋️ Open Planet Fatness Gym");
+      await ctx.reply("🏋️ Welcome back to Planet Fatness Gym!");
     } catch {}
   }
 });
