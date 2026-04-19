@@ -3466,48 +3466,39 @@ function isPrivateChat(ctx: any) {
 
 function getBotUsername(ctx: any) {
   const fromCtx = String(ctx?.botInfo?.username || "").trim().replace(/^@/, "");
-  return fromCtx || TG_BOT_USERNAME || "";
+  return fromCtx || TG_BOT_USERNAME || "PlanetFatnessGymBot";
 }
 
 function buildBotDeepLink(ctx: any, startParam: string) {
   const username = getBotUsername(ctx);
-  if (!username) return null;
   return `https://t.me/${username}?start=${encodeURIComponent(startParam)}`;
 }
 
-function greedLaunchKeyboard(ctx: any) {
-  const privateChat = ctx?.chat?.type === "private";
-  const botUsername =
-    ctx?.botInfo?.username ||
-    process.env.TG_BOT_USERNAME ||
-    "PlanetFatnessGymBot";
-
-  if (!privateChat) {
+function gymLaunchKeyboard(ctx: any) {
+  if (!isPrivateChat(ctx)) {
     return Markup.inlineKeyboard([
-      [Markup.button.url("Open Feed Your Greed", `https://t.me/${botUsername}?start=greed`)],
-      [Markup.button.url("Open in DM", `https://t.me/${botUsername}?start=greed`)],
+      [Markup.button.url("Open Planet Fatness Gym", buildBotDeepLink(ctx, "gym"))],
+      [Markup.button.url("Open Feed Your Greed", buildBotDeepLink(ctx, "greed"))],
+    ]);
+  }
+
+  return Markup.inlineKeyboard([
+    [Markup.button.webApp("Open Planet Fatness Gym", HUB_WEBAPP_URL)],
+    [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
+  ]);
+}
+
+function greedLaunchKeyboard(ctx: any) {
+  if (!isPrivateChat(ctx)) {
+    return Markup.inlineKeyboard([
+      [Markup.button.url("Open Feed Your Greed", buildBotDeepLink(ctx, "greed"))],
+      [Markup.button.url("Open in DM", buildBotDeepLink(ctx, "greed"))],
     ]);
   }
 
   return Markup.inlineKeyboard([
     [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
   ]);
-}
-
-function greedLaunchReplyMarkup(chatType?: string) {
-  const privateChat = chatType === "private";
-  const botUsername = process.env.TG_BOT_USERNAME || "PlanetFatnessGymBot";
-
-  if (!privateChat) {
-    return Markup.inlineKeyboard([
-      [Markup.button.url("Open Feed Your Greed", `https://t.me/${botUsername}?start=greed`)],
-      [Markup.button.url("Open in DM", `https://t.me/${botUsername}?start=greed`)],
-    ]).reply_markup;
-  }
-
-  return Markup.inlineKeyboard([
-    [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-  ]).reply_markup;
 }
 
 function startLaunchKeyboard(ctx: any) {
@@ -3517,10 +3508,11 @@ function startLaunchKeyboard(ctx: any) {
 function greedLaunchReplyMarkup(chatType?: string) {
   const privateChat = chatType === "private";
 
-  if (!privateChat && TG_BOT_USERNAME) {
+  if (!privateChat) {
+    const username = TG_BOT_USERNAME || "PlanetFatnessGymBot";
     return Markup.inlineKeyboard([
-      [Markup.button.webApp("Open Feed Your Greed", GREED_WEBAPP_URL)],
-      [Markup.button.url("Open in DM", `https://t.me/${TG_BOT_USERNAME}?start=greed`)],
+      [Markup.button.url("Open Feed Your Greed", `https://t.me/${username}?start=greed`)],
+      [Markup.button.url("Open in DM", `https://t.me/${username}?start=greed`)],
     ]).reply_markup;
   }
 
