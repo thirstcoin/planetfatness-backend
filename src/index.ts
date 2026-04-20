@@ -1615,7 +1615,7 @@ const GREED_MAX_WAGER = 50000;
 const GREED_MAX_BALANCE_FUND = 250000;
 const GREED_TOTAL_DONUTS = 12;
 const GREED_POISON_COUNT = 2;
-const GREED_JACKPOT_RESEED = 25000;
+const GREED_JACKPOT_RESEED = 50000;
 const GREED_MULTIPLIERS = [1.10, 1.24, 1.40, 1.58, 1.80, 2.08, 2.42, 2.85, 3.50, 5.00];
 
 function getGreedMultiplierForSafeClicks(safeClicks: number) {
