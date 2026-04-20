@@ -3492,7 +3492,6 @@ function greedLaunchKeyboard(ctx: any) {
   if (!isPrivateChat(ctx)) {
     return Markup.inlineKeyboard([
       [Markup.button.url("Open Feed Your Greed", buildBotDeepLink(ctx, "greed"))],
-      [Markup.button.url("Open in DM", buildBotDeepLink(ctx, "greed"))],
     ]);
   }
 
@@ -3512,7 +3511,6 @@ function greedLaunchReplyMarkup(chatType?: string) {
     const username = TG_BOT_USERNAME || "PlanetFatnessGymBot";
     return Markup.inlineKeyboard([
       [Markup.button.url("Open Feed Your Greed", `https://t.me/${username}?start=greed`)],
-      [Markup.button.url("Open in DM", `https://t.me/${username}?start=greed`)],
     ]).reply_markup;
   }
 
