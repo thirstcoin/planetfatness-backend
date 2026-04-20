@@ -162,7 +162,43 @@ export async function initDb() {
     );
   `);
 
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_picks_round ON greed_picks(round_id, created_at ASC);`);
+   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_picks_round ON greed_picks(round_id, created_at ASC);`);
+
+  // Greed spectator guesses
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS greed_spectator_guesses (
+      id BIGSERIAL PRIMARY KEY,
+      round_id BIGINT NOT NULL REFERENCES greed_rounds(id) ON DELETE CASCADE,
+      tg_user_id BIGINT NOT NULL,
+      tg_username TEXT,
+      tg_display_name TEXT,
+      guessed_index INT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(round_id, tg_user_id)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_greed_spectator_guesses_round
+    ON greed_spectator_guesses(round_id, created_at ASC);
+  `);
+
+  // Greed spectator stats
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS greed_spectator_stats (
+      tg_user_id BIGINT PRIMARY KEY,
+      tg_username TEXT,
+      tg_display_name TEXT,
+      total_guesses BIGINT NOT NULL DEFAULT 0,
+      correct_guesses BIGINT NOT NULL DEFAULT 0,
+      wrong_guesses BIGINT NOT NULL DEFAULT 0,
+      current_streak BIGINT NOT NULL DEFAULT 0,
+      best_streak BIGINT NOT NULL DEFAULT 0,
+      last_result TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
   // Internal balances
   await pool.query(`
@@ -180,8 +216,8 @@ export async function initDb() {
     ALTER COLUMN available_balance TYPE NUMERIC(18,3) USING (available_balance::numeric),
     ALTER COLUMN locked_balance TYPE NUMERIC(18,3) USING (locked_balance::numeric);
   `);
-
-  // Deposits
+  
+ // Deposits
   await pool.query(`
     CREATE TABLE IF NOT EXISTS deposits (
       id BIGSERIAL PRIMARY KEY,
@@ -422,7 +458,7 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_tax_ledger_address_created ON greed_tax_ledger(address, created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_greed_tax_ledger_round_id ON greed_tax_ledger(round_id);`);
 
-  console.log("✅ DB ready (TG + games + Greed + balances + deposits + withdrawals + deposit intents + unmatched deposits + jackpot + tax ledger)");
+    console.log("✅ DB ready (TG + games + Greed + spectator guesses + spectator stats + balances + deposits + withdrawals + deposit intents + unmatched deposits + jackpot + tax ledger)");
 }
 
 // -------------------------------
@@ -2139,6 +2175,169 @@ export async function getGreedFeed(limit = 20) {
     LEFT JOIN users u ON u.address = gr.address
     WHERE gr.status = 'closed'
     ORDER BY COALESCE(gr.ended_at, gr.created_at) DESC
+    LIMIT $1;
+    `,
+    [lim]
+  );
+
+  return r.rows || [];
+}
+// -------------------------------
+// Greed spectator helpers
+// -------------------------------
+export async function recordSpectatorGuess(params: {
+  roundId: number;
+  tgUserId: number;
+  tgUsername?: string | null;
+  tgDisplayName?: string | null;
+  guessedIndex: number;
+}) {
+  const roundId = Math.max(0, Math.floor(Number(params.roundId || 0)));
+  const tgUserId = Math.max(0, Math.floor(Number(params.tgUserId || 0)));
+  const guessedIndex = Math.max(0, Math.floor(Number(params.guessedIndex || 0)));
+
+  const tgUsername = params.tgUsername
+    ? String(params.tgUsername).trim().replace(/^@/, "")
+    : null;
+
+  const tgDisplayName = params.tgDisplayName
+    ? String(params.tgDisplayName).trim()
+    : null;
+
+  if (!roundId) throw new Error("missing roundId");
+  if (!tgUserId) throw new Error("missing tgUserId");
+
+  const r = await pool.query(
+    `
+    INSERT INTO greed_spectator_guesses (
+      round_id,
+      tg_user_id,
+      tg_username,
+      tg_display_name,
+      guessed_index,
+      created_at
+    )
+    VALUES ($1,$2,$3,$4,$5,NOW())
+    ON CONFLICT (round_id, tg_user_id) DO NOTHING
+    RETURNING *;
+    `,
+    [roundId, tgUserId, tgUsername, tgDisplayName, guessedIndex]
+  );
+
+  return r.rows[0] || null;
+}
+
+export async function getSpectatorGuessesForRound(roundId: number) {
+  const id = Math.max(0, Math.floor(Number(roundId || 0)));
+  if (!id) throw new Error("missing roundId");
+
+  const r = await pool.query(
+    `
+    SELECT *
+    FROM greed_spectator_guesses
+    WHERE round_id = $1
+    ORDER BY created_at ASC;
+    `,
+    [id]
+  );
+
+  return r.rows || [];
+}
+
+export async function resolveSpectatorGuesses(params: {
+  roundId: number;
+  poisonIndices: number[];
+}) {
+  const roundId = Math.max(0, Math.floor(Number(params.roundId || 0)));
+  const poison = params.poisonIndices || [];
+
+  if (!roundId) throw new Error("missing roundId");
+
+  const guesses = await getSpectatorGuessesForRound(roundId);
+
+  for (const g of guesses) {
+    const isCorrect = poison.includes(Number(g.guessed_index));
+
+    await pool.query(
+      `
+      INSERT INTO greed_spectator_stats (
+        tg_user_id,
+        tg_username,
+        tg_display_name,
+        total_guesses,
+        correct_guesses,
+        wrong_guesses,
+        current_streak,
+        best_streak,
+        last_result,
+        updated_at,
+        created_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        1,
+        $4,
+        $5,
+        $6,
+        $6,
+        $7,
+        NOW(),
+        NOW()
+      )
+      ON CONFLICT (tg_user_id) DO UPDATE
+      SET
+        tg_username = COALESCE(EXCLUDED.tg_username, greed_spectator_stats.tg_username),
+        tg_display_name = COALESCE(EXCLUDED.tg_display_name, greed_spectator_stats.tg_display_name),
+        total_guesses = greed_spectator_stats.total_guesses + 1,
+        correct_guesses = greed_spectator_stats.correct_guesses + $4,
+        wrong_guesses = greed_spectator_stats.wrong_guesses + $5,
+        current_streak = CASE
+          WHEN $4 = 1 THEN greed_spectator_stats.current_streak + 1
+          ELSE 0
+        END,
+        best_streak = GREATEST(
+          greed_spectator_stats.best_streak,
+          CASE
+            WHEN $4 = 1 THEN greed_spectator_stats.current_streak + 1
+            ELSE greed_spectator_stats.best_streak
+          END
+        ),
+        last_result = $7,
+        updated_at = NOW();
+      `,
+      [
+        g.tg_user_id,
+        g.tg_username,
+        g.tg_display_name,
+        isCorrect ? 1 : 0,
+        isCorrect ? 0 : 1,
+        isCorrect ? 1 : 0,
+        isCorrect ? "correct" : "wrong",
+      ]
+    );
+  }
+
+  return true;
+}
+
+export async function getTopSpectators(limit = 25) {
+  const lim = Math.max(1, Math.min(100, Number(limit || 25)));
+
+  const r = await pool.query(
+    `
+    SELECT
+      tg_user_id,
+      tg_username,
+      tg_display_name,
+      total_guesses,
+      correct_guesses,
+      wrong_guesses,
+      current_streak,
+      best_streak
+    FROM greed_spectator_stats
+    ORDER BY best_streak DESC, correct_guesses DESC
     LIMIT $1;
     `,
     [lim]
