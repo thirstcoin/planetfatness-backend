@@ -3789,7 +3789,7 @@ gymBot.command("greedcard", async (ctx) => {
       `Greed Score ${formatAmount3(stats.greed_score)}`,
     ].join("\n");
 
-        await ctx.reply(
+    await ctx.reply(
       msg,
       greedLaunchKeyboard(ctx)
     );
@@ -3797,6 +3797,36 @@ gymBot.command("greedcard", async (ctx) => {
     console.error("GYM /greedcard error:", e);
     try {
       await ctx.reply("Failed to load Greed Card.");
+    } catch {}
+  }
+});
+
+gymBot.command("greedwatch", async (ctx) => {
+  try {
+    const rows = await getTopSpectators(10);
+
+    if (!rows.length) {
+      await ctx.reply("No spectator stats yet.");
+      return;
+    }
+
+    const lines = [
+      "🍩 GREED WATCH LEADERBOARD",
+      "",
+      ...rows.map((r: any, i: number) => {
+        const name =
+          r.tg_username
+            ? `@${r.tg_username}`
+            : r.tg_display_name || `user ${r.tg_user_id}`;
+        return `${i + 1}. ${name} — Best Streak ${Number(r.best_streak || 0)} • Correct ${Number(r.correct_guesses || 0)}`;
+      }),
+    ];
+
+    await ctx.reply(lines.join("\n"), greedLaunchKeyboard(ctx));
+  } catch (e) {
+    console.error("GYM /greedwatch error:", e);
+    try {
+      await ctx.reply("Failed to load spectator leaderboard.");
     } catch {}
   }
 });
