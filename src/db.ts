@@ -347,8 +347,8 @@ export async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS jackpot_state (
       key TEXT PRIMARY KEY,
-      current_amount NUMERIC(18,3) NOT NULL DEFAULT 5000,
-      reseed_amount NUMERIC(18,3) NOT NULL DEFAULT 5000,
+      current_amount NUMERIC(18,3) NOT NULL DEFAULT 50000,
+      reseed_amount NUMERIC(18,3) NOT NULL DEFAULT 50000,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
@@ -360,9 +360,24 @@ export async function initDb() {
   `);
 
   await pool.query(`
+    ALTER TABLE jackpot_state
+    ALTER COLUMN current_amount SET DEFAULT 50000,
+    ALTER COLUMN reseed_amount SET DEFAULT 50000;
+  `);
+
+  await pool.query(`
     INSERT INTO jackpot_state (key, current_amount, reseed_amount)
-    VALUES ('greed', 5000.000, 5000.000)
+    VALUES ('greed', 50000.000, 50000.000)
     ON CONFLICT (key) DO NOTHING;
+  `);
+
+  await pool.query(`
+    UPDATE jackpot_state
+    SET
+      current_amount = GREATEST(current_amount, 50000.000),
+      reseed_amount = 50000.000,
+      updated_at = NOW()
+    WHERE key = 'greed';
   `);
 
   // Greed tax ledger
