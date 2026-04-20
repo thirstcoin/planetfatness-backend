@@ -2969,7 +2969,7 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
       durationMs: 0,
     });
 
-    const liveState = liveSpectatorRounds.get(roundId);
+        const liveState = liveSpectatorRounds.get(roundId);
     if (liveState) {
       await sendGymSpectatorMessageToChat(
         liveState.chatId,
@@ -2981,6 +2981,22 @@ app.post("/greed/cashout", requireAuth, async (req: Request, res: Response) => {
           `Payout: ${formatAmount3(payout)} PHAT`,
         ].join("\n")
       );
+
+      await resolveSpectatorGuesses({
+        roundId,
+        poisonIndices: Array.isArray(closed.poison_indices)
+          ? closed.poison_indices.map((n: unknown) => Number(n))
+          : [],
+      });
+
+      const guesses = await getSpectatorGuessesForRound(roundId);
+      if (guesses.length) {
+        await sendGymSpectatorMessageToChat(
+          liveState.chatId,
+          `📊 ${guesses.length} spectator guess${guesses.length === 1 ? "" : "es"} were locked for this round.`
+        );
+      }
+
       closeLiveRound(roundId);
     }
 
@@ -3787,7 +3803,46 @@ gymBot.command("greedcard", async (ctx) => {
 
 gymBot.on("callback_query", async (ctx) => {
   try {
-    const q = ctx.callbackQuery;
+    const q: any = ctx.callbackQuery;
+
+    if (q?.data && String(q.data).startsWith("donut_")) {
+      const parts = String(q.data).split("_");
+      const roundId = Number(parts[1]);
+      const guessedIndex = Number(parts[2]);
+
+      if (!Number.isFinite(roundId) || roundId <= 0) {
+        await ctx.answerCbQuery("Invalid round.");
+        return;
+      }
+
+      if (!Number.isFinite(guessedIndex) || guessedIndex < 0 || guessedIndex >= GREED_TOTAL_DONUTS) {
+        await ctx.answerCbQuery("Invalid donut.");
+        return;
+      }
+
+      const liveState = liveSpectatorRounds.get(roundId);
+      if (!liveState || !liveState.isActive) {
+        await ctx.answerCbQuery("That round is already over.");
+        return;
+      }
+
+      const guess = await recordSpectatorGuess({
+        roundId,
+        tgUserId: Number(ctx.from.id),
+        tgUsername: ctx.from.username || null,
+        tgDisplayName: `${ctx.from.first_name || ""} ${ctx.from.last_name || ""}`.trim() || ctx.from.first_name || "Member",
+        guessedIndex,
+      });
+
+      if (!guess) {
+        await ctx.answerCbQuery("You already locked a guess for this round.");
+        return;
+      }
+
+      await ctx.answerCbQuery(`Locked in donut #${guessedIndex + 1} 🍩`);
+      return;
+    }
+
     if (q && "game_short_name" in q) {
       const address = `tg:${ctx.from.id}`;
       const token = signTokenForAddress(address);
@@ -3801,7 +3856,7 @@ gymBot.on("callback_query", async (ctx) => {
   } catch (e) {
     console.error("GYM callback handler error:", e);
     try {
-      await ctx.answerCbQuery();
+      await ctx.answerCbQuery("Error");
     } catch {}
   }
 });
