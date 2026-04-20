@@ -91,6 +91,10 @@ const {
   getOpenGreedUnmatchedDeposits,
   markGreedUnmatchedDepositResolved,
   getGreedAdminTreasurySnapshot,
+  recordSpectatorGuess,
+  resolveSpectatorGuesses,
+  getSpectatorGuessesForRound,
+  getTopSpectators,
 } = dbMod;
 
 // -------------------------------
@@ -605,13 +609,23 @@ async function sendMeaningfulGreedFeed(params: {
   }
 }
 
-function pickCardEmojis() {
-  return ["🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩", "🍩"];
-}
-
-function formatDonutBoardLine() {
-  const donuts = pickCardEmojis();
-  return donuts.map((d, i) => `${d}${i + 1}`).join("  ");
+function buildSpectatorDonutKeyboard(roundId: number) {
+  return {
+    inline_keyboard: [
+      [0, 1, 2, 3].map((i) => ({
+        text: `🍩${i + 1}`,
+        callback_data: `donut_${roundId}_${i}`,
+      })),
+      [4, 5, 6, 7].map((i) => ({
+        text: `🍩${i + 1}`,
+        callback_data: `donut_${roundId}_${i}`,
+      })),
+      [8, 9, 10, 11].map((i) => ({
+        text: `🍩${i + 1}`,
+        callback_data: `donut_${roundId}_${i}`,
+      })),
+    ],
+  };
 }
 
 function safeMultiplierLabel(safeClicks: number) {
@@ -2547,15 +2561,12 @@ await sendGymSpectatorMessageToChat(
     }`,
     `Round ID: #${Number(round.id)}`,
     ``,
-    `Pick your donut in chat before they do 👇`,
-    `${formatDonutBoardLine()}`,
+    `Tap a donut below to lock your guess 👇`,
   ].join("\n"),
   {
-    reply_markup: greedLaunchReplyMarkup(
-      spectatorChatId ? "group" : "private"
-    ),
+    reply_markup: buildSpectatorDonutKeyboard(Number(round.id)),
   }
- );
+);
 }
     return res.json({
       ok: true,
@@ -2673,7 +2684,7 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         return res.status(409).json({ error: "Round could not be closed" });
       }
 
-      if (liveState) {
+            if (liveState) {
         await sendGymSpectatorMessageToChat(
           liveState.chatId,
           [
@@ -2683,6 +2694,30 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
             `Round over at ${safeMultiplierLabel(Number(closed.safe_clicks || 0))}`,
           ].join("\n")
         );
+
+        await resolveSpectatorGuesses({
+          roundId,
+          poisonIndices,
+        });
+
+        const guesses = await getSpectatorGuessesForRound(roundId);
+        const winners = guesses.filter((g: any) =>
+          poisonIndices.includes(Number(g.guessed_index))
+        );
+
+        if (winners.length) {
+          await sendGymSpectatorMessageToChat(
+            liveState.chatId,
+            `🎯 Correct chat picks: ${winners
+              .map((w: any) =>
+                w.tg_username
+                  ? `@${w.tg_username}`
+                  : w.tg_display_name || `user ${w.tg_user_id}`
+              )
+              .join(", ")}`
+          );
+        }
+
         closeLiveRound(roundId);
       }
 
@@ -2750,7 +2785,7 @@ await setGreedJackpotAmount(GREED_JACKPOT_RESEED);
         durationMs: 0,
       });
 
-      if (liveState) {
+            if (liveState) {
         await sendGymSpectatorMessageToChat(
           liveState.chatId,
           [
@@ -2761,6 +2796,22 @@ await setGreedJackpotAmount(GREED_JACKPOT_RESEED);
             `Total payout: ${formatAmount3(totalPayout)} PHAT`,
           ].join("\n")
         );
+
+        await resolveSpectatorGuesses({
+          roundId,
+          poisonIndices: Array.isArray(closed.poison_indices)
+            ? closed.poison_indices.map((n: unknown) => Number(n))
+            : [],
+        });
+
+        const guesses = await getSpectatorGuessesForRound(roundId);
+        if (guesses.length) {
+          await sendGymSpectatorMessageToChat(
+            liveState.chatId,
+            `📊 ${guesses.length} spectator guess${guesses.length === 1 ? "" : "es"} were locked for this round.`
+          );
+        }
+
         closeLiveRound(roundId);
       }
 
@@ -2804,23 +2855,10 @@ await setGreedJackpotAmount(GREED_JACKPOT_RESEED);
       return res.status(409).json({ error: "Round progress update failed" });
     }
 
-    if (liveState) {
+        if (liveState) {
       updateLiveRound(roundId, {
         safeClicks: newSafeClicks,
       });
-
-      let spectatorText = [
-        `✅ SAFE PICK`,
-        `${liveState.displayName} picked donut #${pickedIndex + 1}`,
-        `Safe clicks: ${newSafeClicks}`,
-        `Current multiplier: x${newMultiplier.toFixed(2)}`,
-      ].join("\n");
-
-      if (newSafeClicks === 9) {
-        spectatorText += `\n🔥 FINAL DONUT LIVE`;
-      }
-
-      await sendGymSpectatorMessageToChat(liveState.chatId, spectatorText);
     }
 
     return res.json({
