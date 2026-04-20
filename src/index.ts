@@ -3644,7 +3644,7 @@ gymBot.command("greedguide", async (ctx) => {
 "Ecosystem:",
 "Every round feeds the system.",
 "5% goes to:",
-"• Jackpot growth",
+"• Jackpot growth (auto-reseeds at 50,000 PHAT and grows every round)",
 "• Treasury strength",
 "• Burns",
 "• Airdrops",
