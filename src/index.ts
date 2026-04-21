@@ -559,6 +559,29 @@ async function getOpenUnmatchedDepositCount() {
   );
   return Number(r.rows?.[0]?.count || 0);
 }
+async function getSpectatorPickStats(roundId: number) {
+  const r = await pool.query(
+    `
+    SELECT guessed_index, COUNT(*)::int as count
+    FROM greed_spectator_guesses
+    WHERE round_id = $1
+    GROUP BY guessed_index
+    `,
+    [roundId]
+  );
+
+  const total = r.rows.reduce((sum: number, row: any) => sum + Number(row.count), 0);
+
+  const breakdown = r.rows.map((row: any) => ({
+    index: Number(row.guessed_index),
+    count: Number(row.count),
+    pct: total > 0 ? Math.round((Number(row.count) / total) * 100) : 0,
+  }));
+
+  breakdown.sort((a, b) => b.count - a.count || a.index - b.index);
+
+  return { total, breakdown };
+}
 
 function getSpectatorChatIdFromReq(req: Request) {
   const bodyChatId = String((req.body as any)?.spectatorChatId || "").trim();
@@ -2855,10 +2878,36 @@ await setGreedJackpotAmount(GREED_JACKPOT_RESEED);
       return res.status(409).json({ error: "Round progress update failed" });
     }
 
-        if (liveState) {
+            if (liveState) {
       updateLiveRound(roundId, {
         safeClicks: newSafeClicks,
       });
+
+      const spectatorStats = await getSpectatorPickStats(roundId);
+      const topPick = spectatorStats.breakdown[0] || null;
+
+      let spectatorText = [
+        `✅ SAFE PICK`,
+        `${liveState.displayName} picked donut #${pickedIndex + 1}`,
+        `Safe clicks: ${newSafeClicks}`,
+        `Current multiplier: x${newMultiplier.toFixed(2)}`,
+      ];
+
+      if (spectatorStats.total > 0 && topPick) {
+        spectatorText.push(
+          ``,
+          `🍩 Chat leaning: #${topPick.index + 1} (${topPick.count}/${spectatorStats.total}, ${topPick.pct}%)`
+        );
+      }
+
+      if (newSafeClicks === 9) {
+        spectatorText.push(``, `🔥 FINAL DONUT LIVE`);
+      }
+
+      await sendGymSpectatorMessageToChat(
+        liveState.chatId,
+        spectatorText.join("\n")
+      );
     }
 
     return res.json({
