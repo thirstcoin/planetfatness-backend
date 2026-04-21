@@ -2249,14 +2249,15 @@ export async function resolveSpectatorGuesses(params: {
   poisonIndices: number[];
 }) {
   const roundId = Math.max(0, Math.floor(Number(params.roundId || 0)));
-  const poison = params.poisonIndices || [];
+  const poison = (params.poisonIndices || []).map((n) => Number(n));
 
   if (!roundId) throw new Error("missing roundId");
 
   const guesses = await getSpectatorGuessesForRound(roundId);
 
   for (const g of guesses) {
-    const isCorrect = poison.includes(Number(g.guessed_index));
+    const guessedIndex = Number(g.guessed_index);
+    const isCorrect = !poison.includes(guessedIndex);
 
     await pool.query(
       `
