@@ -2878,37 +2878,11 @@ await setGreedJackpotAmount(GREED_JACKPOT_RESEED);
       return res.status(409).json({ error: "Round progress update failed" });
     }
 
-            if (liveState) {
-      updateLiveRound(roundId, {
-        safeClicks: newSafeClicks,
-      });
-
-      const spectatorStats = await getSpectatorPickStats(roundId);
-      const topPick = spectatorStats.breakdown[0] || null;
-
-      let spectatorText = [
-        `✅ SAFE PICK`,
-        `${liveState.displayName} picked donut #${pickedIndex + 1}`,
-        `Safe clicks: ${newSafeClicks}`,
-        `Current multiplier: x${newMultiplier.toFixed(2)}`,
-      ];
-
-      if (spectatorStats.total > 0 && topPick) {
-        spectatorText.push(
-          ``,
-          `🍩 Chat leaning: #${topPick.index + 1} (${topPick.count}/${spectatorStats.total}, ${topPick.pct}%)`
-        );
-      }
-
-      if (newSafeClicks === 9) {
-        spectatorText.push(``, `🔥 FINAL DONUT LIVE`);
-      }
-
-      await sendGymSpectatorMessageToChat(
-        liveState.chatId,
-        spectatorText.join("\n")
-      );
-    }
+ if (liveState) {
+  updateLiveRound(roundId, {
+    safeClicks: newSafeClicks,
+  });
+}
 
     return res.json({
       ok: true,
