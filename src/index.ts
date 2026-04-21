@@ -2701,9 +2701,9 @@ app.post("/greed/pick", requireAuth, async (req: Request, res: Response) => {
         });
 
         const guesses = await getSpectatorGuessesForRound(roundId);
-        const winners = guesses.filter((g: any) =>
-          poisonIndices.includes(Number(g.guessed_index))
-        );
+       const winners = guesses.filter((g: any) =>
+  !poisonIndices.includes(Number(g.guessed_index))
+);
 
         if (winners.length) {
           await sendGymSpectatorMessageToChat(
